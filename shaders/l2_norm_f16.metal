@@ -95,3 +95,29 @@ kernel void l2_distance_direct_f16(
         distances[query_idx * nv + vec_idx] = sum;
     }
 }
+
+/// Direct L2 with FP16-stored vectors. Queries remain float.
+kernel void l2_distance_direct_f16storage(
+    device const float* queries [[buffer(0)]],
+    device const half* vectors [[buffer(1)]],
+    device float* distances [[buffer(2)]],
+    constant uint& d [[buffer(3)]],
+    constant uint& nv [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+
+    uint vec_idx = gid.x;
+    uint query_idx = gid.y;
+
+    float sum = 0.0f;
+    for (uint i = lane; i < d; i += 32) {
+        half diff = half(queries[query_idx * d + i]) - vectors[vec_idx * d + i];
+        sum += float(diff * diff);
+    }
+
+    sum = simd_sum(sum);
+
+    if (lane == 0) {
+        distances[query_idx * nv + vec_idx] = sum;
+    }
+}

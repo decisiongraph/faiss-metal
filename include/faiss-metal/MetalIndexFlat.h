@@ -16,10 +16,13 @@ class MetalIndexFlat : public faiss::Index {
     /// @param resources  Metal resource manager (device, queue, shaders)
     /// @param d          Vector dimension
     /// @param metric     METRIC_L2 or METRIC_INNER_PRODUCT
+    /// @param useFloat16Storage  Store vectors as FP16 (halves memory bandwidth,
+    ///                           slight precision loss). Queries remain FP32.
     MetalIndexFlat(
             std::shared_ptr<MetalResources> resources,
             int d,
-            faiss::MetricType metric = faiss::METRIC_L2);
+            faiss::MetricType metric = faiss::METRIC_L2,
+            bool useFloat16Storage = false);
 
     ~MetalIndexFlat() override;
 
@@ -35,8 +38,12 @@ class MetalIndexFlat : public faiss::Index {
     void reset() override;
     void reconstruct(faiss::idx_t key, float* recons) const override;
 
-    /// Direct access to stored vectors (CPU pointer into unified memory)
+    /// Direct access to stored vectors (CPU pointer into unified memory).
+    /// Returns nullptr if using FP16 storage -- use reconstruct() instead.
     const float* getVectorsData() const;
+
+    /// True if vectors are stored as FP16.
+    bool isFloat16Storage() const;
 
     /// Force MPS GEMM path even on M2+ hardware. For testing both paths.
     void setForceMPS(bool force);

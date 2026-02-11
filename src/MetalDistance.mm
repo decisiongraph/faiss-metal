@@ -38,6 +38,22 @@ MetalDistance::MetalDistance(MetalResources* resources)
         FAISS_THROW_IF_NOT_MSG(directFn, "Metal function 'l2_distance_direct_f16' not found");
         directL2Pipeline_ = [device newComputePipelineStateWithFunction:directFn error:&error];
         FAISS_THROW_IF_NOT_MSG(directL2Pipeline_, "Failed to create direct L2 pipeline");
+
+        // FP16 storage variants (vectors stored as half)
+        id<MTLFunction> gemmF16Fn = [lib newFunctionWithName:@"simdgroup_gemm_f16storage"];
+        FAISS_THROW_IF_NOT_MSG(gemmF16Fn, "Metal function 'simdgroup_gemm_f16storage' not found");
+        simdgroupGemmF16StoragePipeline_ = [device newComputePipelineStateWithFunction:gemmF16Fn error:&error];
+        FAISS_THROW_IF_NOT_MSG(simdgroupGemmF16StoragePipeline_, "Failed to create f16storage GEMM pipeline");
+
+        id<MTLFunction> fusedF16Fn = [lib newFunctionWithName:@"simdgroup_gemm_l2_fused_f16storage"];
+        FAISS_THROW_IF_NOT_MSG(fusedF16Fn, "Metal function 'simdgroup_gemm_l2_fused_f16storage' not found");
+        simdgroupGemmL2FusedF16StoragePipeline_ = [device newComputePipelineStateWithFunction:fusedF16Fn error:&error];
+        FAISS_THROW_IF_NOT_MSG(simdgroupGemmL2FusedF16StoragePipeline_, "Failed to create f16storage fused L2 pipeline");
+
+        id<MTLFunction> directF16Fn = [lib newFunctionWithName:@"l2_distance_direct_f16storage"];
+        FAISS_THROW_IF_NOT_MSG(directF16Fn, "Metal function 'l2_distance_direct_f16storage' not found");
+        directL2F16StoragePipeline_ = [device newComputePipelineStateWithFunction:directF16Fn error:&error];
+        FAISS_THROW_IF_NOT_MSG(directL2F16StoragePipeline_, "Failed to create f16storage direct L2 pipeline");
     }
 }
 
@@ -110,9 +126,11 @@ void MetalDistance::encodeMPS(
     MPSMatrixDescriptor* queryDesc = [MPSMatrixDescriptor
             matrixDescriptorWithRows:nq columns:d
                             rowBytes:d * sizeof(float) dataType:MPSDataTypeFloat32];
+    MPSDataType vecType = vectorsFloat16_ ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+    size_t vecElemSize = vectorsFloat16_ ? sizeof(uint16_t) : sizeof(float);
     MPSMatrixDescriptor* vecDesc = [MPSMatrixDescriptor
             matrixDescriptorWithRows:nv columns:d
-                            rowBytes:d * sizeof(float) dataType:MPSDataTypeFloat32];
+                            rowBytes:d * vecElemSize dataType:vecType];
     MPSMatrixDescriptor* outDesc = [MPSMatrixDescriptor
             matrixDescriptorWithRows:nq columns:nv
                             rowBytes:nv * sizeof(float) dataType:MPSDataTypeFloat32];
@@ -175,8 +193,9 @@ void MetalDistance::encodeSimdGroup(
     if (metric == faiss::METRIC_L2 && nv <= 256) {
         uint32_t d32 = (uint32_t)d;
         uint32_t nv32 = (uint32_t)nv;
+        auto pso = vectorsFloat16_ ? directL2F16StoragePipeline_ : directL2Pipeline_;
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:directL2Pipeline_];
+        [enc setComputePipelineState:pso];
         [enc setBuffer:queries offset:0 atIndex:0];
         [enc setBuffer:vectors offset:0 atIndex:1];
         [enc setBuffer:distOutput offset:0 atIndex:2];
@@ -192,15 +211,15 @@ void MetalDistance::encodeSimdGroup(
     size_t gridY = (nq + 31) / 32;
 
     if (metric == faiss::METRIC_L2) {
-        // Fused path: compute query norms first, then single GEMM kernel
-        // that adds row_norms[i] + col_norms[j] in its epilogue.
-        // Eliminates separate broadcast_sum dispatch.
         l2norm_->encode(cmdBuf, queries, queryNormsBuf, nq, d);
 
         GemmL2Params params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, -2.0f};
+        auto pso = vectorsFloat16_
+            ? simdgroupGemmL2FusedF16StoragePipeline_
+            : simdgroupGemmL2FusedPipeline_;
 
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:simdgroupGemmL2FusedPipeline_];
+        [enc setComputePipelineState:pso];
         [enc setBuffer:queries offset:0 atIndex:0];
         [enc setBuffer:vectors offset:0 atIndex:1];
         [enc setBuffer:distOutput offset:0 atIndex:2];
@@ -211,11 +230,13 @@ void MetalDistance::encodeSimdGroup(
             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         [enc endEncoding];
     } else {
-        // Inner product: plain GEMM
         GemmParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, 1.0f, 0.0f};
+        auto pso = vectorsFloat16_
+            ? simdgroupGemmF16StoragePipeline_
+            : simdgroupGemmPipeline_;
 
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:simdgroupGemmPipeline_];
+        [enc setComputePipelineState:pso];
         [enc setBuffer:queries offset:0 atIndex:0];
         [enc setBuffer:vectors offset:0 atIndex:1];
         [enc setBuffer:distOutput offset:0 atIndex:2];

@@ -12,9 +12,17 @@ namespace faiss_metal {
 
 struct MetalIndexFlat::Impl {
     std::shared_ptr<MetalResources> resources;
+    bool useFloat16Storage = false;
+
+    // FP32 storage (default)
     MetalTensor<float, 2> vectors;   // (ntotal x d) stored vectors
-    MetalTensor<float, 1> norms;     // (ntotal) precomputed ||v||^2
-    size_t capacity = 0;             // allocated capacity in vectors
+
+    // FP16 storage (when useFloat16Storage == true)
+    id<MTLBuffer> vectorsF16Buf = nil;
+    size_t vectorsF16Capacity = 0;   // capacity in number of vectors
+
+    MetalTensor<float, 1> norms;     // (ntotal) precomputed ||v||^2, always FP32
+    size_t capacity = 0;             // allocated capacity in vectors (FP32 mode)
 
     std::unique_ptr<MetalDistance> distance;
     std::unique_ptr<MetalL2Norm> l2norm;
@@ -32,8 +40,9 @@ struct MetalIndexFlat::Impl {
     id<MTLBuffer> getScratchDist(id<MTLDevice> device, size_t bytes) {
         if (bytes > scratchDistBytes) {
             scratchDistBytes = bytes;
+            // Private: GPU-only intermediate (GEMM out → Select in), no CPU access needed
             scratchDistBuf = [device newBufferWithLength:bytes
-                                                options:MTLResourceStorageModeShared];
+                                                options:MTLResourceStorageModePrivate];
         }
         return scratchDistBuf;
     }
@@ -54,25 +63,34 @@ struct MetalIndexFlat::Impl {
     id<MTLBuffer> getScratchQueryNorms(id<MTLDevice> device, size_t nq) {
         if (nq > scratchQueryNormElems) {
             scratchQueryNormElems = nq;
+            // Private: GPU-only intermediate (l2_norm out → GEMM in), no CPU access needed
             scratchQueryNormBuf = [device newBufferWithLength:nq * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
+                                                      options:MTLResourceStorageModePrivate];
         }
         return scratchQueryNormBuf;
     }
 
-    Impl(std::shared_ptr<MetalResources> res)
+    id<MTLBuffer> getVectorsBuf() const {
+        return useFloat16Storage ? vectorsF16Buf : vectors.buffer();
+    }
+
+    Impl(std::shared_ptr<MetalResources> res, bool f16)
             : resources(std::move(res)),
+              useFloat16Storage(f16),
               distance(std::make_unique<MetalDistance>(resources.get())),
               l2norm(std::make_unique<MetalL2Norm>(resources.get())),
-              selector(std::make_unique<MetalSelect>(resources.get())) {}
+              selector(std::make_unique<MetalSelect>(resources.get())) {
+        distance->setVectorsFloat16(f16);
+    }
 };
 
 MetalIndexFlat::MetalIndexFlat(
         std::shared_ptr<MetalResources> resources,
         int d,
-        faiss::MetricType metric)
+        faiss::MetricType metric,
+        bool useFloat16Storage)
         : faiss::Index(d, metric),
-          impl_(std::make_unique<Impl>(std::move(resources))) {
+          impl_(std::make_unique<Impl>(std::move(resources), useFloat16Storage)) {
     is_trained = true;
 }
 
@@ -85,44 +103,79 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
     id<MTLCommandQueue> queue = impl_->resources->getDefaultCommandQueue();
     size_t newTotal = ntotal + n;
 
-    // Grow capacity if needed (2x growth strategy)
-    if (newTotal > impl_->capacity) {
-        size_t newCap = std::max(newTotal, impl_->capacity * 2);
-        newCap = std::max(newCap, (size_t)1024); // minimum 1024 vectors
+    if (impl_->useFloat16Storage) {
+        // --- FP16 storage path ---
+        size_t f16Cap = impl_->vectorsF16Capacity;
+        if (newTotal > f16Cap) {
+            size_t newCap = std::max(newTotal, f16Cap * 2);
+            newCap = std::max(newCap, (size_t)1024);
 
-        MetalTensor<float, 2> newVectors(device, {newCap, (size_t)d});
-        MetalTensor<float, 1> newNorms(device, {newCap});
+            id<MTLBuffer> newBuf = [device newBufferWithLength:newCap * d * sizeof(uint16_t)
+                                                       options:MTLResourceStorageModeShared];
+            MetalTensor<float, 1> newNorms(device, {newCap});
 
-        // Copy existing data
-        if (ntotal > 0) {
-            memcpy(newVectors.data(), impl_->vectors.data(),
-                   ntotal * d * sizeof(float));
-            memcpy(newNorms.data(), impl_->norms.data(),
-                   ntotal * sizeof(float));
+            if (ntotal > 0) {
+                memcpy([newBuf contents], [impl_->vectorsF16Buf contents],
+                       ntotal * d * sizeof(uint16_t));
+                memcpy(newNorms.data(), impl_->norms.data(),
+                       ntotal * sizeof(float));
+            }
+
+            impl_->vectorsF16Buf = newBuf;
+            impl_->vectorsF16Capacity = newCap;
+            impl_->norms = std::move(newNorms);
         }
 
-        impl_->vectors = std::move(newVectors);
-        impl_->norms = std::move(newNorms);
-        impl_->capacity = newCap;
-    }
+        // Convert float32 → float16 and store
+        __fp16* dst = (__fp16*)[impl_->vectorsF16Buf contents] + ntotal * d;
+        for (size_t i = 0; i < (size_t)n * d; i++) {
+            dst[i] = (__fp16)x[i];
+        }
 
-    // Copy new vectors
-    memcpy(impl_->vectors.data() + ntotal * d, x, n * d * sizeof(float));
+        // Compute norms from float32 input (more accurate than from half)
+        if (metric_type == faiss::METRIC_L2) {
+            id<MTLBuffer> newVecBuf = [device newBufferWithBytes:x
+                                                          length:n * d * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+            id<MTLBuffer> tmpNorms = [device newBufferWithLength:n * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+            impl_->l2norm->compute(newVecBuf, tmpNorms, n, d, queue);
+            memcpy(impl_->norms.data() + ntotal,
+                   [tmpNorms contents], n * sizeof(float));
+        }
+    } else {
+        // --- FP32 storage path (original) ---
+        if (newTotal > impl_->capacity) {
+            size_t newCap = std::max(newTotal, impl_->capacity * 2);
+            newCap = std::max(newCap, (size_t)1024);
 
-    // Compute norms for new vectors (for L2)
-    if (metric_type == faiss::METRIC_L2) {
-        // Copy new vectors into a temp buffer for norm computation
-        // (avoids newBufferWithBytesNoCopy which requires page-aligned pointers
-        // and creates aliasing issues with the parent MTLBuffer)
-        id<MTLBuffer> newVecBuf = [device newBufferWithBytes:(impl_->vectors.data() + ntotal * d)
-                                                      length:n * d * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
+            MetalTensor<float, 2> newVectors(device, {newCap, (size_t)d});
+            MetalTensor<float, 1> newNorms(device, {newCap});
 
-        id<MTLBuffer> tmpNorms = [device newBufferWithLength:n * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-        impl_->l2norm->compute(newVecBuf, tmpNorms, n, d, queue);
-        memcpy(impl_->norms.data() + ntotal,
-               [tmpNorms contents], n * sizeof(float));
+            if (ntotal > 0) {
+                memcpy(newVectors.data(), impl_->vectors.data(),
+                       ntotal * d * sizeof(float));
+                memcpy(newNorms.data(), impl_->norms.data(),
+                       ntotal * sizeof(float));
+            }
+
+            impl_->vectors = std::move(newVectors);
+            impl_->norms = std::move(newNorms);
+            impl_->capacity = newCap;
+        }
+
+        memcpy(impl_->vectors.data() + ntotal * d, x, n * d * sizeof(float));
+
+        if (metric_type == faiss::METRIC_L2) {
+            id<MTLBuffer> newVecBuf = [device newBufferWithBytes:(impl_->vectors.data() + ntotal * d)
+                                                          length:n * d * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+            id<MTLBuffer> tmpNorms = [device newBufferWithLength:n * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+            impl_->l2norm->compute(newVecBuf, tmpNorms, n, d, queue);
+            memcpy(impl_->norms.data() + ntotal,
+                   [tmpNorms contents], n * sizeof(float));
+        }
     }
 
     ntotal = newTotal;
@@ -162,7 +215,7 @@ void MetalIndexFlat::search(
                         length:n * d * sizeof(float)
                        options:MTLResourceStorageModeShared];
 
-    id<MTLBuffer> vecBuf = impl_->vectors.buffer();
+    id<MTLBuffer> vecBuf = impl_->getVectorsBuf();
     id<MTLBuffer> normBuf = impl_->norms.buffer();
 
     // Reuse scratch buffers across calls
@@ -213,6 +266,8 @@ void MetalIndexFlat::reset() {
     ntotal = 0;
     impl_->capacity = 0;
     impl_->vectors = MetalTensor<float, 2>();
+    impl_->vectorsF16Buf = nil;
+    impl_->vectorsF16Capacity = 0;
     impl_->norms = MetalTensor<float, 1>();
     impl_->scratchDistBuf = nil;
     impl_->scratchDistBytes = 0;
@@ -227,11 +282,23 @@ void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {
     FAISS_THROW_IF_NOT_MSG(
             key >= 0 && key < ntotal,
             "reconstruct: key out of range");
-    memcpy(recons, impl_->vectors.data() + key * d, d * sizeof(float));
+    if (impl_->useFloat16Storage) {
+        const __fp16* src = (const __fp16*)[impl_->vectorsF16Buf contents] + key * d;
+        for (int i = 0; i < d; i++) {
+            recons[i] = (float)src[i];
+        }
+    } else {
+        memcpy(recons, impl_->vectors.data() + key * d, d * sizeof(float));
+    }
 }
 
 const float* MetalIndexFlat::getVectorsData() const {
+    if (impl_->useFloat16Storage) return nullptr;
     return impl_->vectors.data();
+}
+
+bool MetalIndexFlat::isFloat16Storage() const {
+    return impl_->useFloat16Storage;
 }
 
 void MetalIndexFlat::setForceMPS(bool force) {
@@ -262,7 +329,16 @@ std::unique_ptr<faiss::IndexFlat> index_metal_to_cpu(
             metal_index->d, metal_index->metric_type);
 
     if (metal_index->ntotal > 0) {
-        cpu_index->add(metal_index->ntotal, metal_index->getVectorsData());
+        if (metal_index->isFloat16Storage()) {
+            // Reconstruct each vector from FP16 → FP32
+            std::vector<float> tmp(metal_index->d);
+            for (faiss::idx_t i = 0; i < metal_index->ntotal; i++) {
+                metal_index->reconstruct(i, tmp.data());
+                cpu_index->add(1, tmp.data());
+            }
+        } else {
+            cpu_index->add(metal_index->ntotal, metal_index->getVectorsData());
+        }
     }
 
     return cpu_index;

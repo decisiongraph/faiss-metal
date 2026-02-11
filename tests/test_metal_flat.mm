@@ -220,6 +220,53 @@ static void test_reconstruct() {
     printf("PASS\n");
 }
 
+static void test_flat_l2_f16(size_t nv, size_t nq, size_t d, size_t k) {
+    printf("test_flat_l2_f16 (nv=%zu, nq=%zu, d=%zu, k=%zu)... ", nv, nq, d, k);
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> vectors(nv * d);
+    std::vector<float> queries(nq * d);
+    for (auto& v : vectors) v = dist(rng);
+    for (auto& v : queries) v = dist(rng);
+
+    // CPU reference
+    faiss::IndexFlatL2 cpu_index(d);
+    cpu_index.add(nv, vectors.data());
+
+    std::vector<float> cpu_distances(nq * k);
+    std::vector<faiss::idx_t> cpu_labels(nq * k);
+    cpu_index.search(nq, queries.data(), k, cpu_distances.data(), cpu_labels.data());
+
+    // Metal FP16
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, d, faiss::METRIC_L2, /*useFloat16Storage=*/true);
+    assert(metal_index.isFloat16Storage());
+    metal_index.add(nv, vectors.data());
+
+    std::vector<float> metal_distances(nq * k);
+    std::vector<faiss::idx_t> metal_labels(nq * k);
+    metal_index.search(nq, queries.data(), k, metal_distances.data(), metal_labels.data());
+
+    // FP16 has lower precision, use relaxed tolerance (top-1 still must match)
+    compare_results("L2-F16", nq, k,
+                    metal_distances.data(), metal_labels.data(),
+                    cpu_distances.data(), cpu_labels.data(),
+                    5e-2f);
+
+    // Test reconstruct round-trip
+    std::vector<float> recons(d);
+    metal_index.reconstruct(0, recons.data());
+    // Half precision: ~3 decimal digits, so ~1e-3 tolerance per element
+    for (size_t i = 0; i < (size_t)d; i++) {
+        float diff = std::abs(recons[i] - vectors[i]);
+        assert(diff < 2e-3f && "FP16 reconstruct precision too low");
+    }
+
+    printf("PASS\n");
+}
+
 static void test_forced_mps_search() {
     printf("test_forced_mps_search (L2+IP via MPS path)... ");
 
@@ -279,6 +326,10 @@ int main() {
 
         // Inner product
         test_flat_ip(1000, 10, 128, 10);
+
+        // FP16 storage
+        test_flat_l2_f16(1000, 10, 128, 10);
+        test_flat_l2_f16(500, 5, 768, 5);
 
         // Edge cases
         test_flat_l2(100, 1, 32, 1);   // single query, k=1

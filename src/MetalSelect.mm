@@ -62,9 +62,14 @@ void MetalSelect::encode(
     } else {
         pipeline = wantMin ? blockSelectMinPipeline_ : blockSelectMaxPipeline_;
         blockThreads = blockSelectThreads_;
+        constexpr size_t LOCAL_K_LIMIT = 8; // must match shader #define LOCAL_K
+        size_t maxK = blockThreads * LOCAL_K_LIMIT;
+        FAISS_THROW_IF_NOT_FMT(
+                k <= maxK,
+                "k (%zu) exceeds Metal block_select limit (%zu = %zu threads * %zu local_k)",
+                k, maxK, blockThreads, LOCAL_K_LIMIT);
     }
 
-    constexpr size_t LOCAL_K = 8; // must match shader #define
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:distances offset:0 atIndex:0];
@@ -73,6 +78,7 @@ void MetalSelect::encode(
     [encoder setBytes:&nv32 length:sizeof(nv32) atIndex:3];
     [encoder setBytes:&k32 length:sizeof(k32) atIndex:4];
     if (k > 32) {
+        constexpr size_t LOCAL_K = 8; // must match shader #define
         size_t tgMemBytes = blockThreads * LOCAL_K * sizeof(float);
         [encoder setThreadgroupMemoryLength:tgMemBytes atIndex:0];
         [encoder setThreadgroupMemoryLength:tgMemBytes atIndex:1];

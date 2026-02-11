@@ -54,7 +54,7 @@ static void bench(
         printf("  CPU:   %.2f ms/search  (%.0f QPS)\n", avg_ms, qps);
     }
 
-    // --- Metal ---
+    // --- Metal FP32 ---
     {
         faiss_metal::MetalIndexFlat metal_index(g_res, d, faiss::METRIC_L2);
         metal_index.add(nv, vectors.data());
@@ -70,7 +70,27 @@ static void bench(
         double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
         double avg_ms = total_ms / bench_iters;
         double qps = (nq * bench_iters) / (total_ms / 1000.0);
-        printf("  Metal: %.2f ms/search  (%.0f QPS)\n", avg_ms, qps);
+        printf("  Metal:     %.2f ms/search  (%.0f QPS)\n", avg_ms, qps);
+    }
+
+    // --- Metal FP16 storage ---
+    {
+        faiss_metal::MetalIndexFlat metal_f16(g_res, d, faiss::METRIC_L2,
+                                              /*useFloat16Storage=*/true);
+        metal_f16.add(nv, vectors.data());
+
+        for (int i = 0; i < warmup_iters; i++)
+            metal_f16.search(nq, queries.data(), k, distances.data(), labels.data());
+
+        auto start = Clock::now();
+        for (int i = 0; i < bench_iters; i++)
+            metal_f16.search(nq, queries.data(), k, distances.data(), labels.data());
+        auto end = Clock::now();
+
+        double total_ms = std::chrono::duration<double, std::milli>(end - start).count();
+        double avg_ms = total_ms / bench_iters;
+        double qps = (nq * bench_iters) / (total_ms / 1000.0);
+        printf("  Metal F16: %.2f ms/search  (%.0f QPS)\n", avg_ms, qps);
     }
     printf("\n");
 }
