@@ -1,6 +1,7 @@
 #pragma once
 
 #include <faiss/Index.h>
+#include <faiss/IndexFlat.h>
 #include <faiss/MetricType.h>
 #include <memory>
 

@@ -58,9 +58,32 @@ metal_index->search(nq, queries, k, distances, labels);
 auto cpu_index2 = faiss_metal::index_metal_to_cpu(metal_index.get());
 ```
 
-## Build
+## Prerequisites
 
-Requires macOS 12+, CMake 3.24+, Xcode CLI tools, and FAISS installed.
+- **macOS 14+** on Apple Silicon (M1/M2/M3/M4)
+- **Xcode** (full install, not just Command Line Tools) — required for Metal compiler and MPS framework
+- **Metal Toolchain** — must be downloaded separately:
+  ```bash
+  xcodebuild -downloadComponent MetalToolchain
+  ```
+- **CMake 3.24+**
+- **FAISS** — installed as a library (e.g. via Homebrew, nix, or from source)
+- **OpenMP** — required by FAISS (e.g. `libomp` from Homebrew or nix)
+
+### Using devenv (recommended)
+
+The project includes a [devenv](https://devenv.sh) configuration that provides cmake, faiss, and openmp via nix. The Metal compiler and frameworks come from your Xcode install.
+
+```bash
+devenv shell
+build          # configure & build
+test           # build & run tests
+bench          # build & run benchmarks
+```
+
+> **Note:** The devenv scripts unset `SDKROOT` and use `/usr/bin/clang` because nix's apple-sdk lacks Metal Toolchain and MPS headers. The system compiler + real macOS SDK is required for Metal development.
+
+### Manual build
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release

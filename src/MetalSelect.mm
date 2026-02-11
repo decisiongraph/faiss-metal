@@ -78,8 +78,8 @@ void MetalSelect::encode(
                 initWithDevice:resources_->getDevice() numberOfTopKValues:k];
         [topk encodeToCommandBuffer:cmdBuf
                        inputMatrix:distMat
-                      resultMatrix:outDistMat
-                resultIndexMatrix:outIdxMat];
+                 resultIndexMatrix:outIdxMat
+                 resultValueMatrix:outDistMat];
         return;
     }
 

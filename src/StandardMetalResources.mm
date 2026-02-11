@@ -3,6 +3,7 @@
 #import "MetalContext.h"
 #import <Foundation/Foundation.h>
 #include <stdexcept>
+#include <string>
 
 namespace faiss_metal {
 

@@ -3,6 +3,10 @@
 #include <cstdint>
 #include <string>
 
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+#endif
+
 namespace faiss_metal {
 
 /// Apple Silicon generation detected via Metal GPU family.
@@ -57,8 +61,6 @@ struct MetalDeviceCapabilities {
 };
 
 #ifdef __OBJC__
-#import <Metal/Metal.h>
-
 /// Query capabilities from a Metal device.
 MetalDeviceCapabilities queryDeviceCapabilities(id<MTLDevice> device);
 #endif

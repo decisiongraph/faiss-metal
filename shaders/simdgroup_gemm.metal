@@ -108,26 +108,31 @@ kernel void simdgroup_gemm_f32_via_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store: half accumulator → float32 output
+    // Store: half accumulator → threadgroup half → float32 output
+    threadgroup half store_buf[BM][BN + 4] __attribute__((aligned(16)));
+
     for (uint i = 0; i < 2; i++) {
         for (uint j = 0; j < 2; j++) {
-            uint out_row_base = m_start + simd_m + i * 8;
-            uint out_col_base = n_start + simd_n + j * 8;
+            simdgroup_store(c_frag[i][j],
+                            &store_buf[simd_m + i * 8][simd_n + j * 8],
+                            BN + 4);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            for (uint r = 0; r < 8; r++) {
-                for (uint c_idx = 0; c_idx < 8; c_idx++) {
-                    uint out_row = out_row_base + r;
-                    uint out_col = out_col_base + c_idx;
-                    if (out_row < params.M && out_col < params.N) {
-                        uint idx = out_row * params.N + out_col;
-                        float val = float(half(params.alpha) * c_frag[i][j][r][c_idx]);
-                        if (params.beta != 0.0f) {
-                            val += params.beta * C[idx];
-                        }
-                        C[idx] = val;
-                    }
-                }
+    // Convert from threadgroup half to device float with alpha/beta scaling
+    for (uint idx = thread_id; idx < BM * BN; idx += total_threads) {
+        uint r = idx / BN;
+        uint c = idx % BN;
+        uint out_row = m_start + r;
+        uint out_col = n_start + c;
+        if (out_row < params.M && out_col < params.N) {
+            uint oidx = out_row * params.N + out_col;
+            float val = float(store_buf[r][c]) * params.alpha;
+            if (params.beta != 0.0f) {
+                val += params.beta * C[oidx];
             }
+            C[oidx] = val;
         }
     }
 }
