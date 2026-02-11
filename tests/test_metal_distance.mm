@@ -197,9 +197,33 @@ static void test_ip_distance() {
                 cpuDist += queries[i * d + k] * vectors[j * d + k];
             }
             float absDiff = std::abs(metalDist[i * nv + j] - cpuDist);
-            // FP16 GEMM path (M2+) has larger absolute error
-            assert(absDiff < 5e-1f && "IP distance mismatch");
+            float relDiff = absDiff / std::max(std::abs(cpuDist), 1e-6f);
+            // FP16 GEMM path (M2+) has ~1e-2 relative error; FP32 MPS path ~1e-4
+            assert(relDiff < 5e-2f && "IP distance mismatch");
         }
+    }
+
+    // Verify top-1 correctness: best IP result must match CPU
+    for (size_t i = 0; i < nq; i++) {
+        size_t metalBest = 0, cpuBest = 0;
+        float metalBestD = metalDist[i * nv];
+        float cpuBestD = 0.0f;
+        for (size_t k = 0; k < d; k++)
+            cpuBestD += queries[i * d + k] * vectors[0];
+        for (size_t j = 1; j < nv; j++) {
+            if (metalDist[i * nv + j] > metalBestD) {
+                metalBestD = metalDist[i * nv + j];
+                metalBest = j;
+            }
+            float cpuD = 0.0f;
+            for (size_t k = 0; k < d; k++)
+                cpuD += queries[i * d + k] * vectors[j * d + k];
+            if (cpuD > cpuBestD) {
+                cpuBestD = cpuD;
+                cpuBest = j;
+            }
+        }
+        assert(metalBest == cpuBest && "IP top-1 label mismatch");
     }
 
     printf("PASS\n");

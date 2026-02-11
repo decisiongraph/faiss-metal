@@ -40,7 +40,6 @@ add_custom_target(metal_shaders DEPENDS ${CMAKE_BINARY_DIR}/faiss_metal.metallib
 # --- Library ---
 set(FAISS_METAL_SOURCES
     src/MetalContext.mm
-    src/MetalResources.mm
     src/MetalDeviceCapabilities.mm
     src/StandardMetalResources.mm
     src/MetalL2Norm.mm

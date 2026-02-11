@@ -2,10 +2,11 @@
 using namespace metal;
 
 /// SIMD-group level top-k selection for small k (k <= 32).
-/// Each SIMD group processes one query row using a bitonic sorting network.
-/// This is the fast path -- for k <= 32, we can keep the entire top-k in registers.
+/// Each SIMD group processes one query row.
+/// Each lane maintains one slot in a sorted top-k buffer.
 ///
 /// Dispatch: threadgroups = nq, threads_per_threadgroup = 32
+/// Output is sorted (lane 0 = best, lane k-1 = worst of top-k).
 
 kernel void warp_select_min(
     device const float* distances [[buffer(0)]],   // (nq x nv)
@@ -16,24 +17,20 @@ kernel void warp_select_min(
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
 
-    // Each lane maintains one slot in the top-k buffer
-    // lane i holds the i-th best value (lane 0 = best, lane k-1 = worst of top-k)
+    // Each lane holds one slot: lane 0 = best (smallest), lane k-1 = k-th best
     float my_dist = INFINITY;
     int32_t my_idx = -1;
 
     device const float* row_data = distances + row * nv;
 
-    // Phase 1: scan all values
     for (uint i = lane; i < nv; i += 32) {
         float d = row_data[i];
 
-        // Check if this value should enter the top-k
-        // The k-th lane holds the current threshold
+        // Threshold: worst value currently in top-k (lane k-1)
         float threshold = simd_broadcast(my_dist, k - 1);
 
         if (d < threshold) {
-            // Insert into sorted position using SIMD shuffle
-            // Find insertion point
+            // Find insertion point: count how many current top-k values are better
             uint pos = 0;
             for (uint j = 0; j < k; j++) {
                 float other = simd_broadcast(my_dist, j);
@@ -41,28 +38,28 @@ kernel void warp_select_min(
             }
 
             if (pos < k) {
-                // Shift elements down and insert
-                float prev_d = my_dist;
-                int32_t prev_i = my_idx;
+                // Snapshot current values across ALL lanes before any mutation
+                // Use simd_shuffle to read lane-1's value from the snapshot
+                float old_dist = my_dist;
+                int32_t old_idx = my_idx;
 
-                float new_d = simd_broadcast(d, 0); // broadcast doesn't change value
-                int32_t new_i = (int32_t)i;
-
-                // Each lane decides what value to hold
                 if (lane == pos) {
                     // This lane takes the new value
                     my_dist = d;
                     my_idx = (int32_t)i;
                 } else if (lane > pos && lane < k) {
-                    // Shift: take value from lane-1
-                    my_dist = simd_shuffle_up(prev_d, 1);
-                    my_idx = simd_shuffle_up(prev_i, 1);
+                    // Shift down: this lane takes what was in lane-1
+                    // simd_shuffle reads from the pre-mutation snapshot (old_dist)
+                    // which is correct since all lanes captured their values above
+                    my_dist = simd_shuffle(old_dist, lane - 1);
+                    my_idx = simd_shuffle(old_idx, lane - 1);
                 }
+                // Lanes < pos and lanes >= k: unchanged
             }
         }
     }
 
-    // Phase 2: write results
+    // Write sorted results
     if (lane < k) {
         out_distances[row * k + lane] = my_dist;
         out_indices[row * k + lane] = my_idx;
@@ -96,15 +93,15 @@ kernel void warp_select_max(
             }
 
             if (pos < k) {
-                float prev_d = my_dist;
-                int32_t prev_i = my_idx;
+                float old_dist = my_dist;
+                int32_t old_idx = my_idx;
 
                 if (lane == pos) {
                     my_dist = d;
                     my_idx = (int32_t)i;
                 } else if (lane > pos && lane < k) {
-                    my_dist = simd_shuffle_up(prev_d, 1);
-                    my_idx = simd_shuffle_up(prev_i, 1);
+                    my_dist = simd_shuffle(old_dist, lane - 1);
+                    my_idx = simd_shuffle(old_idx, lane - 1);
                 }
             }
         }

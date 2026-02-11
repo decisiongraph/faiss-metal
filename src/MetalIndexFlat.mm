@@ -20,6 +20,35 @@ struct MetalIndexFlat::Impl {
     std::unique_ptr<MetalL2Norm> l2norm;
     std::unique_ptr<MetalSelect> selector;
 
+    // Scratch buffers reused across search() calls to avoid per-call allocation
+    id<MTLBuffer> scratchDistBuf = nil;
+    size_t scratchDistBytes = 0;
+    id<MTLBuffer> scratchOutDistBuf = nil;
+    id<MTLBuffer> scratchOutIdxBuf = nil;
+    size_t scratchTopkElems = 0;
+
+    id<MTLBuffer> getScratchDist(id<MTLDevice> device, size_t bytes) {
+        if (bytes > scratchDistBytes) {
+            scratchDistBytes = bytes;
+            scratchDistBuf = [device newBufferWithLength:bytes
+                                                options:MTLResourceStorageModeShared];
+        }
+        return scratchDistBuf;
+    }
+
+    void getScratchTopk(id<MTLDevice> device, size_t elems,
+                        id<MTLBuffer>& outDist, id<MTLBuffer>& outIdx) {
+        if (elems > scratchTopkElems) {
+            scratchTopkElems = elems;
+            scratchOutDistBuf = [device newBufferWithLength:elems * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+            scratchOutIdxBuf = [device newBufferWithLength:elems * sizeof(int32_t)
+                                                   options:MTLResourceStorageModeShared];
+        }
+        outDist = scratchOutDistBuf;
+        outIdx = scratchOutIdxBuf;
+    }
+
     Impl(std::shared_ptr<MetalResources> res)
             : resources(std::move(res)),
               distance(std::make_unique<MetalDistance>(resources.get())),
@@ -71,35 +100,18 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
 
     // Compute norms for new vectors (for L2)
     if (metric_type == faiss::METRIC_L2) {
-        // Create a temporary buffer pointing to the new vectors region
-        id<MTLBuffer> newVecBuf = [device
-                newBufferWithBytesNoCopy:(void*)(impl_->vectors.data() + ntotal * d)
-                                  length:n * d * sizeof(float)
-                                 options:MTLResourceStorageModeShared
-                             deallocator:nil];
+        // Copy new vectors into a temp buffer for norm computation
+        // (avoids newBufferWithBytesNoCopy which requires page-aligned pointers
+        // and creates aliasing issues with the parent MTLBuffer)
+        id<MTLBuffer> newVecBuf = [device newBufferWithBytes:(impl_->vectors.data() + ntotal * d)
+                                                      length:n * d * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
 
-        // If NoCopy failed (alignment), fall back
-        if (!newVecBuf) {
-            newVecBuf = [device newBufferWithBytes:(impl_->vectors.data() + ntotal * d)
-                                            length:n * d * sizeof(float)
-                                           options:MTLResourceStorageModeShared];
-        }
-
-        id<MTLBuffer> newNormBuf = [device
-                newBufferWithBytesNoCopy:(void*)(impl_->norms.data() + ntotal)
-                                  length:n * sizeof(float)
-                                 options:MTLResourceStorageModeShared
-                             deallocator:nil];
-        if (!newNormBuf) {
-            // Compute to temp buffer, then copy
-            id<MTLBuffer> tmpNorms = [device newBufferWithLength:n * sizeof(float)
-                                                         options:MTLResourceStorageModeShared];
-            impl_->l2norm->compute(newVecBuf, tmpNorms, n, d, queue);
-            memcpy(impl_->norms.data() + ntotal,
-                   [tmpNorms contents], n * sizeof(float));
-        } else {
-            impl_->l2norm->compute(newVecBuf, newNormBuf, n, d, queue);
-        }
+        id<MTLBuffer> tmpNorms = [device newBufferWithLength:n * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        impl_->l2norm->compute(newVecBuf, tmpNorms, n, d, queue);
+        memcpy(impl_->norms.data() + ntotal,
+               [tmpNorms contents], n * sizeof(float));
     }
 
     ntotal = newTotal;
@@ -113,8 +125,14 @@ void MetalIndexFlat::search(
         faiss::idx_t* labels,
         const faiss::SearchParameters* params) const {
 
+    FAISS_THROW_IF_NOT_MSG(k > 0, "k must be > 0");
+
+    // Metal shaders use int32_t indices — cap at 2^31-1 vectors
+    FAISS_THROW_IF_NOT_MSG(
+            ntotal <= (faiss::idx_t)INT32_MAX,
+            "MetalIndexFlat supports at most 2^31-1 vectors (int32 indices)");
+
     if (n == 0 || ntotal == 0) {
-        // Fill with sentinel values
         for (faiss::idx_t i = 0; i < n * k; i++) {
             distances[i] = (metric_type == faiss::METRIC_L2) ? INFINITY : -INFINITY;
             labels[i] = -1;
@@ -122,57 +140,52 @@ void MetalIndexFlat::search(
         return;
     }
 
-    FAISS_THROW_IF_NOT_MSG(
-            k > 0 && k <= ntotal,
-            "k must be > 0 and <= ntotal");
+    // Clamp k to ntotal (matches FAISS CPU behavior)
+    faiss::idx_t effective_k = std::min(k, (faiss::idx_t)ntotal);
 
     id<MTLDevice> device = impl_->resources->getDevice();
     id<MTLCommandQueue> queue = impl_->resources->getDefaultCommandQueue();
 
-    // Create query buffer (zero-copy if page-aligned, otherwise copy)
     id<MTLBuffer> queryBuf = [device
             newBufferWithBytes:x
                         length:n * d * sizeof(float)
                        options:MTLResourceStorageModeShared];
 
-    // Vectors buffer: use underlying MTLBuffer, but only ntotal rows
-    // We can create a view by using offset in the encoder, but for simplicity
-    // we'll create a wrapper pointing to the right region
     id<MTLBuffer> vecBuf = impl_->vectors.buffer();
-
-    // Norms buffer
     id<MTLBuffer> normBuf = impl_->norms.buffer();
 
-    // Distance output: (n x ntotal) -- can be large!
+    // Reuse scratch buffers across calls
     size_t distBytes = n * ntotal * sizeof(float);
-    id<MTLBuffer> distBuf = [device newBufferWithLength:distBytes
-                                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> distBuf = impl_->getScratchDist(device, distBytes);
 
-    // Step 1: Compute distances
     impl_->distance->compute(
             queryBuf, vecBuf, normBuf, distBuf,
             n, ntotal, d, metric_type, queue);
 
-    // Step 2: Top-k selection
-    // Output buffers for top-k (int32_t indices from Metal)
-    id<MTLBuffer> outDistBuf = [device newBufferWithLength:n * k * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    id<MTLBuffer> outIdxBuf = [device newBufferWithLength:n * k * sizeof(int32_t)
-                                                   options:MTLResourceStorageModeShared];
+    id<MTLBuffer> outDistBuf, outIdxBuf;
+    impl_->getScratchTopk(device, n * effective_k, outDistBuf, outIdxBuf);
 
     impl_->selector->select(
             distBuf, outDistBuf, outIdxBuf,
-            n, ntotal, k, metric_type, queue);
+            n, ntotal, effective_k, metric_type, queue);
 
     // Copy results back
     float* outDistPtr = (float*)[outDistBuf contents];
     int32_t* outIdxPtr = (int32_t*)[outIdxBuf contents];
 
-    memcpy(distances, outDistPtr, n * k * sizeof(float));
+    float sentinel_dist = (metric_type == faiss::METRIC_L2) ? INFINITY : -INFINITY;
 
-    // Convert int32_t → idx_t (int64_t)
-    for (faiss::idx_t i = 0; i < n * k; i++) {
-        labels[i] = (faiss::idx_t)outIdxPtr[i];
+    for (faiss::idx_t i = 0; i < n; i++) {
+        // Copy effective_k results
+        for (faiss::idx_t j = 0; j < effective_k; j++) {
+            distances[i * k + j] = outDistPtr[i * effective_k + j];
+            labels[i * k + j] = (faiss::idx_t)outIdxPtr[i * effective_k + j];
+        }
+        // Fill remaining slots if k > ntotal
+        for (faiss::idx_t j = effective_k; j < k; j++) {
+            distances[i * k + j] = sentinel_dist;
+            labels[i * k + j] = -1;
+        }
     }
 }
 
@@ -181,6 +194,11 @@ void MetalIndexFlat::reset() {
     impl_->capacity = 0;
     impl_->vectors = MetalTensor<float, 2>();
     impl_->norms = MetalTensor<float, 1>();
+    impl_->scratchDistBuf = nil;
+    impl_->scratchDistBytes = 0;
+    impl_->scratchOutDistBuf = nil;
+    impl_->scratchOutIdxBuf = nil;
+    impl_->scratchTopkElems = 0;
 }
 
 void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {

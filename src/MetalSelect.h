@@ -13,7 +13,7 @@ class MetalResources;
 /// Routes to different implementations based on k and device capabilities:
 ///   k <= 16: MPSMatrixFindTopK
 ///   k <= 32: warp_select (SIMD-group level)
-///   k > 32: block_select (threadgroup level, M3+ uses 512 threads)
+///   k > 32: block_select (threadgroup level)
 class MetalSelect {
    public:
     MetalSelect(MetalResources* resources);
@@ -30,9 +30,9 @@ class MetalSelect {
 
    private:
     MetalResources* resources_;
-    bool hasDynamicThreadgroupMem_; // M3+: can use larger threadgroups
 
     id<MTLComputePipelineState> blockSelectMinPipeline_;
+    id<MTLComputePipelineState> blockSelectMaxPipeline_;
     id<MTLComputePipelineState> warpSelectMinPipeline_;
     id<MTLComputePipelineState> warpSelectMaxPipeline_;
 };

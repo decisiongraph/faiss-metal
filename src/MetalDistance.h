@@ -4,10 +4,12 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <faiss/MetricType.h>
 #include <cstddef>
+#include <memory>
 
 namespace faiss_metal {
 
 class MetalResources;
+class MetalL2Norm;
 
 /// Distance computation on Metal.
 ///
@@ -21,6 +23,7 @@ class MetalResources;
 class MetalDistance {
    public:
     MetalDistance(MetalResources* resources);
+    ~MetalDistance();
 
     /// Compute all-pairs distances between queries and database vectors.
     void compute(
@@ -37,6 +40,7 @@ class MetalDistance {
    private:
     MetalResources* resources_;
     bool useSimdGroupGemm_; // M2+: use custom GEMM instead of MPS
+    std::unique_ptr<MetalL2Norm> l2norm_; // reused across calls
 
     id<MTLComputePipelineState> broadcastSumPipeline_;
     id<MTLComputePipelineState> simdgroupGemmPipeline_; // simdgroup_gemm_f32_via_f16

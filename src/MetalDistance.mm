@@ -7,13 +7,15 @@
 
 namespace faiss_metal {
 
-// Must match struct in simdgroup_gemm.metal
+// Must match struct GemmParams in shaders/simdgroup_gemm.metal
 struct GemmParams {
     uint32_t M, N, K;
     float alpha, beta;
 };
 
-MetalDistance::MetalDistance(MetalResources* resources) : resources_(resources) {
+MetalDistance::MetalDistance(MetalResources* resources)
+        : resources_(resources),
+          l2norm_(std::make_unique<MetalL2Norm>(resources)) {
     id<MTLLibrary> lib = resources->getMetalLibrary();
     id<MTLDevice> device = resources->getDevice();
     NSError* error = nil;
@@ -41,6 +43,8 @@ MetalDistance::MetalDistance(MetalResources* resources) : resources_(resources) 
         FAISS_THROW_IF_NOT_MSG(directL2Pipeline_, "Failed to create direct L2 pipeline");
     }
 }
+
+MetalDistance::~MetalDistance() = default;
 
 void MetalDistance::compute(
         id<MTLBuffer> queries,
@@ -108,8 +112,7 @@ void MetalDistance::computeMPS(
         // L2: -2*Q*V^T, then add norms
         id<MTLBuffer> queryNorms = [device newBufferWithLength:nq * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-        MetalL2Norm normComputer(resources_);
-        normComputer.compute(queries, queryNorms, nq, d, queue);
+        l2norm_->compute(queries, queryNorms, nq, d, queue);
 
         MPSMatrixMultiplication* gemm = [[MPSMatrixMultiplication alloc]
                 initWithDevice:device transposeLeft:false transposeRight:true
@@ -119,13 +122,10 @@ void MetalDistance::computeMPS(
         id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
         [gemm encodeToCommandBuffer:cmdBuf leftMatrix:queryMat
                         rightMatrix:vecMat resultMatrix:outMat];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
 
-        // Add norms
+        // Encode broadcast_sum into same command buffer
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
         uint32_t nv32 = (uint32_t)nv;
-        id<MTLCommandBuffer> cmdBuf2 = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmdBuf2 computeCommandEncoder];
         [enc setComputePipelineState:broadcastSumPipeline_];
         [enc setBuffer:distOutput offset:0 atIndex:0];
         [enc setBuffer:queryNorms offset:0 atIndex:1];
@@ -136,8 +136,9 @@ void MetalDistance::computeMPS(
                                         std::min((size_t)4, nq), 1);
         [enc dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
         [enc endEncoding];
-        [cmdBuf2 commit];
-        [cmdBuf2 waitUntilCompleted];
+
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
     }
 }
 
@@ -178,12 +179,9 @@ void MetalDistance::computeSimdGroup(
     }
 
     // simdgroup_matrix GEMM for Q * V^T
-    // The shader computes C = alpha * A * B^T + beta * C
-    // A = queries (nq x d), B = vectors (nv x d) → C = (nq x nv)
     float alpha = (metric == faiss::METRIC_L2) ? -2.0f : 1.0f;
     GemmParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, alpha, 0.0f};
 
-    // Dispatch GEMM: grid = (ceil(N/32), ceil(M/32)), threadgroup = (32, 4) = 128
     size_t gridX = (nv + 31) / 32;
     size_t gridY = (nq + 31) / 32;
 
@@ -197,17 +195,19 @@ void MetalDistance::computeSimdGroup(
     [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
         threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
     [enc endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
 
     if (metric == faiss::METRIC_L2) {
         // Add norms: dist[i][j] += ||q_i||^2 + ||v_j||^2
         id<MTLBuffer> queryNorms = [device newBufferWithLength:nq * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
-        MetalL2Norm normComputer(resources_);
-        normComputer.compute(queries, queryNorms, nq, d, queue);
+        // Norm computation needs its own command buffer (separate encode)
+        l2norm_->compute(queries, queryNorms, nq, d, queue);
 
         uint32_t nv32 = (uint32_t)nv;
+        // Encode broadcast_sum - must wait for GEMM first
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+
         id<MTLCommandBuffer> cmdBuf2 = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc2 = [cmdBuf2 computeCommandEncoder];
         [enc2 setComputePipelineState:broadcastSumPipeline_];
@@ -222,6 +222,9 @@ void MetalDistance::computeSimdGroup(
         [enc2 endEncoding];
         [cmdBuf2 commit];
         [cmdBuf2 waitUntilCompleted];
+    } else {
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
     }
 }
 
