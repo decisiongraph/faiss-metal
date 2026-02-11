@@ -31,6 +31,9 @@ class MetalDistance {
     /// Tell distance kernels that the vectors buffer contains half (FP16) data.
     void setVectorsFloat16(bool f16) { vectorsFloat16_ = f16; }
 
+    /// Tell distance kernels that the vectors buffer contains bfloat16 data.
+    void setVectorsBFloat16(bool bf16) { vectorsBFloat16_ = bf16; }
+
     /// Encode distance computation into an existing command buffer.
     /// For L2, also needs a scratch buffer for query norms (queryNormsBuf).
     /// Caller is responsible for committing.
@@ -44,6 +47,24 @@ class MetalDistance {
             size_t nq,
             size_t nv,
             size_t d,
+            faiss::MetricType metric);
+
+    /// Encode fused distance + top-k into a command buffer.
+    /// Eliminates the nq*nv intermediate distance matrix.
+    /// Returns true if the fused path was used, false if caller should
+    /// fall back to separate encode() + select().
+    bool encodeFused(
+            id<MTLCommandBuffer> cmdBuf,
+            id<MTLBuffer> queries,
+            id<MTLBuffer> vectors,
+            id<MTLBuffer> vecNorms,
+            id<MTLBuffer> queryNormsBuf,
+            id<MTLBuffer> outDistances,
+            id<MTLBuffer> outIndices,
+            size_t nq,
+            size_t nv,
+            size_t d,
+            size_t k,
             faiss::MetricType metric);
 
     /// Convenience: create command buffer, encode, commit, wait.
@@ -63,6 +84,7 @@ class MetalDistance {
     bool useSimdGroupGemm_; // M2+: use custom GEMM instead of MPS
     bool forceMPS_ = false; // override: force MPS path for testing
     bool vectorsFloat16_ = false; // vectors stored as half
+    bool vectorsBFloat16_ = false; // vectors stored as bfloat16
     std::unique_ptr<MetalL2Norm> l2norm_; // reused across calls
 
     id<MTLComputePipelineState> broadcastSumPipeline_;
@@ -74,6 +96,24 @@ class MetalDistance {
     id<MTLComputePipelineState> simdgroupGemmF16StoragePipeline_;
     id<MTLComputePipelineState> simdgroupGemmL2FusedF16StoragePipeline_;
     id<MTLComputePipelineState> directL2F16StoragePipeline_;
+
+    // BFloat16 storage pipelines (M2+/macOS 14+)
+    id<MTLComputePipelineState> bf16GemmPipeline_;
+    id<MTLComputePipelineState> bf16GemmL2FusedPipeline_;
+
+    // Family 9 (M3/M4) direct device read pipelines (FP16 storage only)
+    bool useFamily9Direct_ = false;
+    bool useFamily9Large_ = false;
+    id<MTLComputePipelineState> directGemmF16StoragePipeline_;
+    id<MTLComputePipelineState> directGemmL2FusedF16StoragePipeline_;
+    id<MTLComputePipelineState> largeDirectGemmF16StoragePipeline_;
+    id<MTLComputePipelineState> largeDirectGemmL2FusedF16StoragePipeline_;
+
+    // Fused distance + top-k pipelines (eliminates intermediate buffer)
+    id<MTLComputePipelineState> fusedL2TopkMinPipeline_;
+    id<MTLComputePipelineState> fusedIPTopkMaxPipeline_;
+    id<MTLComputePipelineState> fusedL2TopkMinF16StoragePipeline_;
+    id<MTLComputePipelineState> fusedIPTopkMaxF16StoragePipeline_;
 
     void encodeMPS(
             id<MTLCommandBuffer> cmdBuf,
@@ -89,6 +129,14 @@ class MetalDistance {
             id<MTLBuffer> vecNorms, id<MTLBuffer> queryNormsBuf,
             id<MTLBuffer> distOutput,
             size_t nq, size_t nv, size_t d,
+            faiss::MetricType metric);
+
+    void encodeFusedImpl(
+            id<MTLCommandBuffer> cmdBuf,
+            id<MTLBuffer> queries, id<MTLBuffer> vectors,
+            id<MTLBuffer> vecNorms, id<MTLBuffer> queryNormsBuf,
+            id<MTLBuffer> outDistances, id<MTLBuffer> outIndices,
+            size_t nq, size_t nv, size_t d, size_t k,
             faiss::MetricType metric);
 };
 

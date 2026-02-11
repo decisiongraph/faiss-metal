@@ -55,6 +55,51 @@ MetalDistance::MetalDistance(MetalResources* resources)
         directL2F16StoragePipeline_ = [device newComputePipelineStateWithFunction:directF16Fn error:&error];
         FAISS_THROW_IF_NOT_MSG(directL2F16StoragePipeline_, "Failed to create f16storage direct L2 pipeline");
     }
+
+    // BFloat16 storage pipelines (M2+/macOS 14+)
+    if (caps.hasBFloat16) {
+        id<MTLFunction> bf16GemmFn = [lib newFunctionWithName:@"simdgroup_gemm_bf16storage"];
+        FAISS_THROW_IF_NOT_MSG(bf16GemmFn, "Metal function 'simdgroup_gemm_bf16storage' not found");
+        bf16GemmPipeline_ = [device newComputePipelineStateWithFunction:bf16GemmFn error:&error];
+        FAISS_THROW_IF_NOT_MSG(bf16GemmPipeline_, "Failed to create bf16 GEMM pipeline");
+
+        id<MTLFunction> bf16L2Fn = [lib newFunctionWithName:@"simdgroup_gemm_l2_fused_bf16storage"];
+        FAISS_THROW_IF_NOT_MSG(bf16L2Fn, "Metal function 'simdgroup_gemm_l2_fused_bf16storage' not found");
+        bf16GemmL2FusedPipeline_ = [device newComputePipelineStateWithFunction:bf16L2Fn error:&error];
+        FAISS_THROW_IF_NOT_MSG(bf16GemmL2FusedPipeline_, "Failed to create bf16 fused L2 pipeline");
+    }
+
+    // Family 9 (M3/M4) direct device read pipelines
+    useFamily9Direct_ = caps.hasDynamicThreadgroupMemory;
+    useFamily9Large_ = caps.hasDynamicThreadgroupMemory;
+    if (useFamily9Direct_) {
+        auto makePso = [&](NSString* name) -> id<MTLComputePipelineState> {
+            id<MTLFunction> fn = [lib newFunctionWithName:name];
+            FAISS_THROW_IF_NOT_FMT(fn, "Metal function '%s' not found", [name UTF8String]);
+            id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&error];
+            FAISS_THROW_IF_NOT_FMT(pso, "Failed to create pipeline '%s'", [name UTF8String]);
+            return pso;
+        };
+
+        directGemmF16StoragePipeline_ = makePso(@"simdgroup_gemm_direct_f16storage");
+        directGemmL2FusedF16StoragePipeline_ = makePso(@"simdgroup_gemm_l2_fused_direct_f16storage");
+        largeDirectGemmF16StoragePipeline_ = makePso(@"simdgroup_gemm_large_direct_f16storage");
+        largeDirectGemmL2FusedF16StoragePipeline_ = makePso(@"simdgroup_gemm_l2_fused_large_direct_f16storage");
+    }
+
+    // Fused distance + top-k pipelines (all chips, gated by nq/k at dispatch)
+    auto makePipeline = [&](NSString* name) -> id<MTLComputePipelineState> {
+        id<MTLFunction> fn = [lib newFunctionWithName:name];
+        FAISS_THROW_IF_NOT_FMT(fn, "Metal function '%s' not found", [name UTF8String]);
+        id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&error];
+        FAISS_THROW_IF_NOT_FMT(pso, "Failed to create pipeline '%s'", [name UTF8String]);
+        return pso;
+    };
+
+    fusedL2TopkMinPipeline_ = makePipeline(@"fused_l2_topk_min");
+    fusedIPTopkMaxPipeline_ = makePipeline(@"fused_ip_topk_max");
+    fusedL2TopkMinF16StoragePipeline_ = makePipeline(@"fused_l2_topk_min_f16storage");
+    fusedIPTopkMaxF16StoragePipeline_ = makePipeline(@"fused_ip_topk_max_f16storage");
 }
 
 MetalDistance::~MetalDistance() = default;
@@ -207,16 +252,36 @@ void MetalDistance::encodeSimdGroup(
         return;
     }
 
-    size_t gridX = (nv + 31) / 32;
-    size_t gridY = (nq + 31) / 32;
+    // Select tile size and pipeline variant based on device generation.
+    // Family 9 (M3/M4) with FP16 storage: use direct device reads.
+    // Large tiles (64x64) for Family 9 when problem is large enough to benefit.
+    bool useLargeTile = useFamily9Large_ && vectorsFloat16_
+                        && nv >= 256 && nq >= 64;
+    bool useDirectRead = useFamily9Direct_ && vectorsFloat16_ && !useLargeTile;
+
+    size_t tileM = useLargeTile ? 64 : 32;
+    size_t tileN = useLargeTile ? 64 : 32;
+    size_t gridX = (nv + tileN - 1) / tileN;
+    size_t gridY = (nq + tileM - 1) / tileM;
+    size_t threadsY = useLargeTile ? 8 : 4; // 256 or 128 threads
 
     if (metric == faiss::METRIC_L2) {
         l2norm_->encode(cmdBuf, queries, queryNormsBuf, nq, d);
 
         GemmL2Params params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, -2.0f};
-        auto pso = vectorsFloat16_
-            ? simdgroupGemmL2FusedF16StoragePipeline_
-            : simdgroupGemmL2FusedPipeline_;
+
+        id<MTLComputePipelineState> pso;
+        if (useLargeTile) {
+            pso = largeDirectGemmL2FusedF16StoragePipeline_;
+        } else if (useDirectRead) {
+            pso = directGemmL2FusedF16StoragePipeline_;
+        } else if (vectorsBFloat16_) {
+            pso = bf16GemmL2FusedPipeline_;
+        } else {
+            pso = vectorsFloat16_
+                ? simdgroupGemmL2FusedF16StoragePipeline_
+                : simdgroupGemmL2FusedPipeline_;
+        }
 
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -227,13 +292,23 @@ void MetalDistance::encodeSimdGroup(
         [enc setBuffer:queryNormsBuf offset:0 atIndex:4];
         [enc setBuffer:vecNorms offset:0 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32, threadsY, 1)];
         [enc endEncoding];
     } else {
         GemmParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, 1.0f, 0.0f};
-        auto pso = vectorsFloat16_
-            ? simdgroupGemmF16StoragePipeline_
-            : simdgroupGemmPipeline_;
+
+        id<MTLComputePipelineState> pso;
+        if (useLargeTile) {
+            pso = largeDirectGemmF16StoragePipeline_;
+        } else if (useDirectRead) {
+            pso = directGemmF16StoragePipeline_;
+        } else if (vectorsBFloat16_) {
+            pso = bf16GemmPipeline_;
+        } else {
+            pso = vectorsFloat16_
+                ? simdgroupGemmF16StoragePipeline_
+                : simdgroupGemmPipeline_;
+        }
 
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
         [enc setComputePipelineState:pso];
@@ -242,9 +317,91 @@ void MetalDistance::encodeSimdGroup(
         [enc setBuffer:distOutput offset:0 atIndex:2];
         [enc setBytes:&params length:sizeof(params) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
-            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32, threadsY, 1)];
         [enc endEncoding];
     }
+}
+
+// --- Fused distance + top-k path ---
+
+bool MetalDistance::encodeFused(
+        id<MTLCommandBuffer> cmdBuf,
+        id<MTLBuffer> queries,
+        id<MTLBuffer> vectors,
+        id<MTLBuffer> vecNorms,
+        id<MTLBuffer> queryNormsBuf,
+        id<MTLBuffer> outDistances,
+        id<MTLBuffer> outIndices,
+        size_t nq,
+        size_t nv,
+        size_t d,
+        size_t k,
+        faiss::MetricType metric) {
+
+    // Fused path: beneficial when nq is small (avoids nq*nv intermediate buffer).
+    // For nq > 4, the GEMM path is better due to query batching (BM=32 amortization).
+    // Requires k <= 32 (warp_select constraint).
+    if (nq == 0 || nv == 0 || k == 0 || k > 32 || nq > 4) {
+        return false;
+    }
+
+    // For very small nv, the direct L2 path or GEMM path is already fast enough
+    if (nv <= 256) {
+        return false;
+    }
+
+    if (metric == faiss::METRIC_L2) {
+        l2norm_->encode(cmdBuf, queries, queryNormsBuf, nq, d);
+    }
+
+    encodeFusedImpl(cmdBuf, queries, vectors, vecNorms, queryNormsBuf,
+                    outDistances, outIndices, nq, nv, d, k, metric);
+    return true;
+}
+
+void MetalDistance::encodeFusedImpl(
+        id<MTLCommandBuffer> cmdBuf,
+        id<MTLBuffer> queries,
+        id<MTLBuffer> vectors,
+        id<MTLBuffer> vecNorms,
+        id<MTLBuffer> queryNormsBuf,
+        id<MTLBuffer> outDistances,
+        id<MTLBuffer> outIndices,
+        size_t nq,
+        size_t nv,
+        size_t d,
+        size_t k,
+        faiss::MetricType metric) {
+
+    FusedTopkParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, (uint32_t)k};
+
+    id<MTLComputePipelineState> pso;
+    if (metric == faiss::METRIC_L2) {
+        pso = vectorsFloat16_ ? fusedL2TopkMinF16StoragePipeline_ : fusedL2TopkMinPipeline_;
+    } else {
+        pso = vectorsFloat16_ ? fusedIPTopkMaxF16StoragePipeline_ : fusedIPTopkMaxPipeline_;
+    }
+
+    id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:queries offset:0 atIndex:0];
+    [enc setBuffer:vectors offset:0 atIndex:1];
+    if (metric == faiss::METRIC_L2) {
+        [enc setBuffer:queryNormsBuf offset:0 atIndex:2];
+        [enc setBuffer:vecNorms offset:0 atIndex:3];
+    }
+    [enc setBuffer:outDistances offset:0 atIndex:4];
+    [enc setBuffer:outIndices offset:0 atIndex:5];
+    [enc setBytes:&params length:sizeof(params) atIndex:6];
+
+    // Threadgroup memory: shared_query, partial_dist, partial_idx
+    [enc setThreadgroupMemoryLength:d * sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:4 * 32 * sizeof(float) atIndex:1];
+    [enc setThreadgroupMemoryLength:4 * 32 * sizeof(int32_t) atIndex:2];
+
+    [enc dispatchThreadgroups:MTLSizeMake(nq, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    [enc endEncoding];
 }
 
 } // namespace faiss_metal

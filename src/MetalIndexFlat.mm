@@ -1,5 +1,6 @@
 #import <faiss-metal/MetalIndexFlat.h>
 #import <faiss-metal/MetalResources.h>
+#import <faiss-metal/StandardMetalResources.h>
 #import <faiss/IndexFlat.h>
 #import "MetalDistance.h"
 #import "MetalL2Norm.h"
@@ -12,7 +13,9 @@ namespace faiss_metal {
 
 struct MetalIndexFlat::Impl {
     std::shared_ptr<MetalResources> resources;
+    StorageType storageType = StorageType::Float32;
     bool useFloat16Storage = false;
+    bool useBFloat16Storage = false;
 
     // FP32 storage (default)
     MetalTensor<float, 2> vectors;   // (ntotal x d) stored vectors
@@ -71,16 +74,20 @@ struct MetalIndexFlat::Impl {
     }
 
     id<MTLBuffer> getVectorsBuf() const {
-        return useFloat16Storage ? vectorsF16Buf : vectors.buffer();
+        return (useFloat16Storage || useBFloat16Storage)
+            ? vectorsF16Buf : vectors.buffer();
     }
 
-    Impl(std::shared_ptr<MetalResources> res, bool f16)
+    Impl(std::shared_ptr<MetalResources> res, StorageType storage)
             : resources(std::move(res)),
-              useFloat16Storage(f16),
+              storageType(storage),
+              useFloat16Storage(storage == StorageType::Float16),
+              useBFloat16Storage(storage == StorageType::BFloat16),
               distance(std::make_unique<MetalDistance>(resources.get())),
               l2norm(std::make_unique<MetalL2Norm>(resources.get())),
               selector(std::make_unique<MetalSelect>(resources.get())) {
-        distance->setVectorsFloat16(f16);
+        distance->setVectorsFloat16(useFloat16Storage);
+        distance->setVectorsBFloat16(useBFloat16Storage);
     }
 };
 
@@ -90,7 +97,18 @@ MetalIndexFlat::MetalIndexFlat(
         faiss::MetricType metric,
         bool useFloat16Storage)
         : faiss::Index(d, metric),
-          impl_(std::make_unique<Impl>(std::move(resources), useFloat16Storage)) {
+          impl_(std::make_unique<Impl>(std::move(resources),
+                useFloat16Storage ? StorageType::Float16 : StorageType::Float32)) {
+    is_trained = true;
+}
+
+MetalIndexFlat::MetalIndexFlat(
+        std::shared_ptr<MetalResources> resources,
+        int d,
+        faiss::MetricType metric,
+        StorageType storage)
+        : faiss::Index(d, metric),
+          impl_(std::make_unique<Impl>(std::move(resources), storage)) {
     is_trained = true;
 }
 
@@ -103,8 +121,8 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
     id<MTLCommandQueue> queue = impl_->resources->getDefaultCommandQueue();
     size_t newTotal = ntotal + n;
 
-    if (impl_->useFloat16Storage) {
-        // --- FP16 storage path ---
+    if (impl_->useFloat16Storage || impl_->useBFloat16Storage) {
+        // --- Reduced-precision storage path (FP16 or BF16) ---
         size_t f16Cap = impl_->vectorsF16Capacity;
         if (newTotal > f16Cap) {
             size_t newCap = std::max(newTotal, f16Cap * 2);
@@ -124,12 +142,31 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
             impl_->vectorsF16Buf = newBuf;
             impl_->vectorsF16Capacity = newCap;
             impl_->norms = std::move(newNorms);
+
+            // Register new buffers for proactive GPU residency
+            if (auto* std_res = dynamic_cast<StandardMetalResources*>(impl_->resources.get())) {
+                std_res->registerForResidency(impl_->vectorsF16Buf);
+                std_res->registerForResidency(impl_->norms.buffer());
+            }
         }
 
-        // Convert float32 → float16 and store
-        __fp16* dst = (__fp16*)[impl_->vectorsF16Buf contents] + ntotal * d;
-        for (size_t i = 0; i < (size_t)n * d; i++) {
-            dst[i] = (__fp16)x[i];
+        // Convert float32 → reduced precision and store
+        if (impl_->useBFloat16Storage) {
+            // BFloat16: truncate float32 mantissa (keep top 7 bits + 8-bit exponent)
+            uint16_t* dst = (uint16_t*)[impl_->vectorsF16Buf contents] + ntotal * d;
+            const uint32_t* src = (const uint32_t*)x;
+            for (size_t i = 0; i < (size_t)n * d; i++) {
+                // Standard float32→bfloat16: round-to-nearest-even
+                uint32_t bits = src[i];
+                uint32_t lsb = (bits >> 16) & 1;
+                uint32_t rounding = 0x7FFF + lsb;
+                dst[i] = (uint16_t)((bits + rounding) >> 16);
+            }
+        } else {
+            __fp16* dst = (__fp16*)[impl_->vectorsF16Buf contents] + ntotal * d;
+            for (size_t i = 0; i < (size_t)n * d; i++) {
+                dst[i] = (__fp16)x[i];
+            }
         }
 
         // Compute norms from float32 input (more accurate than from half)
@@ -162,6 +199,12 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
             impl_->vectors = std::move(newVectors);
             impl_->norms = std::move(newNorms);
             impl_->capacity = newCap;
+
+            // Register new buffers for proactive GPU residency
+            if (auto* std_res = dynamic_cast<StandardMetalResources*>(impl_->resources.get())) {
+                std_res->registerForResidency(impl_->vectors.buffer());
+                std_res->registerForResidency(impl_->norms.buffer());
+            }
         }
 
         memcpy(impl_->vectors.data() + ntotal * d, x, n * d * sizeof(float));
@@ -218,27 +261,36 @@ void MetalIndexFlat::search(
     id<MTLBuffer> vecBuf = impl_->getVectorsBuf();
     id<MTLBuffer> normBuf = impl_->norms.buffer();
 
-    // Reuse scratch buffers across calls
-    size_t distBytes = n * ntotal * sizeof(float);
-    id<MTLBuffer> distBuf = impl_->getScratchDist(device, distBytes);
-
     id<MTLBuffer> outDistBuf, outIdxBuf;
     impl_->getScratchTopk(device, n * effective_k, outDistBuf, outIdxBuf);
 
-    // Single command buffer: distance + top-k in one GPU submission.
-    // All k values use GPU-native selection (no MPS, no CPU fallback).
     id<MTLBuffer> queryNormsBuf = nil;
     if (metric_type == faiss::METRIC_L2) {
         queryNormsBuf = impl_->getScratchQueryNorms(device, n);
     }
 
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-    impl_->distance->encode(
+
+    // Try fused distance+topk path (avoids nq*nv intermediate buffer).
+    // Falls back to separate GEMM + select for large nq or k > 32.
+    bool usedFused = impl_->distance->encodeFused(
             cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
-            distBuf, n, ntotal, d, metric_type);
-    impl_->selector->encode(
-            cmdBuf, distBuf, outDistBuf, outIdxBuf,
-            nil, nil, nil, n, ntotal, effective_k, metric_type);
+            outDistBuf, outIdxBuf,
+            n, ntotal, d, effective_k, metric_type);
+
+    if (!usedFused) {
+        // Standard path: full distance matrix + separate top-k selection
+        size_t distBytes = n * ntotal * sizeof(float);
+        id<MTLBuffer> distBuf = impl_->getScratchDist(device, distBytes);
+
+        impl_->distance->encode(
+                cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
+                distBuf, n, ntotal, d, metric_type);
+        impl_->selector->encode(
+                cmdBuf, distBuf, outDistBuf, outIdxBuf,
+                nil, nil, nil, n, ntotal, effective_k, metric_type);
+    }
+
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
 
@@ -282,7 +334,14 @@ void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {
     FAISS_THROW_IF_NOT_MSG(
             key >= 0 && key < ntotal,
             "reconstruct: key out of range");
-    if (impl_->useFloat16Storage) {
+    if (impl_->useBFloat16Storage) {
+        // BFloat16 → float32: shift left by 16 bits
+        const uint16_t* src = (const uint16_t*)[impl_->vectorsF16Buf contents] + key * d;
+        uint32_t* dst = (uint32_t*)recons;
+        for (int i = 0; i < d; i++) {
+            dst[i] = (uint32_t)src[i] << 16;
+        }
+    } else if (impl_->useFloat16Storage) {
         const __fp16* src = (const __fp16*)[impl_->vectorsF16Buf contents] + key * d;
         for (int i = 0; i < d; i++) {
             recons[i] = (float)src[i];
@@ -293,12 +352,20 @@ void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {
 }
 
 const float* MetalIndexFlat::getVectorsData() const {
-    if (impl_->useFloat16Storage) return nullptr;
+    if (impl_->useFloat16Storage || impl_->useBFloat16Storage) return nullptr;
     return impl_->vectors.data();
 }
 
 bool MetalIndexFlat::isFloat16Storage() const {
     return impl_->useFloat16Storage;
+}
+
+bool MetalIndexFlat::isBFloat16Storage() const {
+    return impl_->useBFloat16Storage;
+}
+
+StorageType MetalIndexFlat::getStorageType() const {
+    return impl_->storageType;
 }
 
 void MetalIndexFlat::setForceMPS(bool force) {
@@ -329,8 +396,8 @@ std::unique_ptr<faiss::IndexFlat> index_metal_to_cpu(
             metal_index->d, metal_index->metric_type);
 
     if (metal_index->ntotal > 0) {
-        if (metal_index->isFloat16Storage()) {
-            // Reconstruct each vector from FP16 → FP32
+        if (metal_index->isFloat16Storage() || metal_index->isBFloat16Storage()) {
+            // Reconstruct each vector from reduced precision → FP32
             std::vector<float> tmp(metal_index->d);
             for (faiss::idx_t i = 0; i < metal_index->ntotal; i++) {
                 metal_index->reconstruct(i, tmp.data());

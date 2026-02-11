@@ -25,3 +25,12 @@ struct GemmL2Params {
     uint32 K;
     float alpha;    // -2.0 for L2
 };
+
+/// Params for fused distance + top-k kernel.
+/// Eliminates the nq*nv intermediate distance matrix for small nq.
+struct FusedTopkParams {
+    uint32 nq;      // number of queries
+    uint32 nv;      // number of vectors
+    uint32 d;       // dimension
+    uint32 k;       // top-k
+};

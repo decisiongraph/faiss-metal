@@ -9,6 +9,13 @@ namespace faiss_metal {
 
 class MetalResources;
 
+/// Vector storage precision for MetalIndexFlat.
+enum class StorageType : uint8_t {
+    Float32 = 0,    // Full precision (default)
+    Float16 = 1,    // FP16: 2x bandwidth savings, 5-bit exponent
+    BFloat16 = 2,   // BF16: 2x bandwidth savings, 8-bit exponent (wider range)
+};
+
 /// Flat (brute-force) index on Metal GPU.
 /// Subclasses faiss::Index directly -- all data lives in MTLBuffers (unified memory).
 class MetalIndexFlat : public faiss::Index {
@@ -23,6 +30,13 @@ class MetalIndexFlat : public faiss::Index {
             int d,
             faiss::MetricType metric = faiss::METRIC_L2,
             bool useFloat16Storage = false);
+
+    /// Extended constructor with explicit storage type.
+    MetalIndexFlat(
+            std::shared_ptr<MetalResources> resources,
+            int d,
+            faiss::MetricType metric,
+            StorageType storage);
 
     ~MetalIndexFlat() override;
 
@@ -44,6 +58,12 @@ class MetalIndexFlat : public faiss::Index {
 
     /// True if vectors are stored as FP16.
     bool isFloat16Storage() const;
+
+    /// True if vectors are stored as BFloat16.
+    bool isBFloat16Storage() const;
+
+    /// Get the storage type.
+    StorageType getStorageType() const;
 
     /// Force MPS GEMM path even on M2+ hardware. For testing both paths.
     void setForceMPS(bool force);

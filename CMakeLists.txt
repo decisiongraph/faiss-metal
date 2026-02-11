@@ -54,7 +54,7 @@ foreach(METAL_SRC ${METAL_SOURCES})
     set(AIR_FILE ${CMAKE_BINARY_DIR}/${METAL_NAME}.air)
     add_custom_command(
         OUTPUT ${AIR_FILE}
-        COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal3.0 -I ${CMAKE_SOURCE_DIR}/shaders -c ${METAL_SRC} -o ${AIR_FILE}
+        COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal3.1 -I ${CMAKE_SOURCE_DIR}/shaders -c ${METAL_SRC} -o ${AIR_FILE}
         DEPENDS ${METAL_SRC}
         COMMENT "Compiling ${METAL_NAME}.metal → .air"
     )

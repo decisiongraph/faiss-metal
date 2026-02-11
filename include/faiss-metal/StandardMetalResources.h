@@ -20,6 +20,10 @@ class StandardMetalResources : public MetalResources {
 
     id<MTLBuffer> allocBuffer(size_t size) override;
     void deallocBuffer(id<MTLBuffer> buf) override;
+
+    /// Register a buffer for proactive GPU residency.
+    /// Pre-pages GPU memory to avoid page fault latency on first access.
+    void registerForResidency(id<MTLBuffer> buffer);
 #endif
 
    private:

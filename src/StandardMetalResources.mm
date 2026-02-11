@@ -12,6 +12,7 @@ struct StandardMetalResources::Impl {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     MetalDeviceCapabilities capabilities;
+    id<NSObject> residencySet; // id<MTLResidencySet>, typed as NSObject for availability
 
     Impl() {
         auto& ctx = MetalContext::instance();
@@ -27,6 +28,19 @@ struct StandardMetalResources::Impl {
 
         // Query device capabilities
         capabilities = queryDeviceCapabilities(device);
+
+        // Create residency set for proactive GPU page residency.
+        // Buffers registered here are pre-paged to avoid page fault
+        // latency on first GPU access.
+        if (@available(macOS 15.0, *)) {
+            MTLResidencySetDescriptor* rsDesc = [[MTLResidencySetDescriptor alloc] init];
+            rsDesc.initialCapacity = 8;
+            NSError* rsError = nil;
+            residencySet = [device newResidencySetWithDescriptor:rsDesc error:&rsError];
+            if (residencySet) {
+                [(id<MTLResidencySet>)residencySet requestResidency];
+            }
+        }
     }
 };
 
@@ -64,6 +78,16 @@ id<MTLBuffer> StandardMetalResources::allocBuffer(size_t size) {
 void StandardMetalResources::deallocBuffer(id<MTLBuffer> buf) {
     // ARC handles deallocation; explicit release not needed
     (void)buf;
+}
+
+void StandardMetalResources::registerForResidency(id<MTLBuffer> buffer) {
+    if (@available(macOS 15.0, *)) {
+        id<MTLResidencySet> rs = (id<MTLResidencySet>)impl_->residencySet;
+        if (rs && buffer) {
+            [rs addAllocation:buffer];
+            [rs commit];
+        }
+    }
 }
 
 } // namespace faiss_metal
