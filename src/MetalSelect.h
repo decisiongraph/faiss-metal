@@ -18,6 +18,23 @@ class MetalSelect {
    public:
     MetalSelect(MetalResources* resources);
 
+    /// Encode top-k selection into an existing command buffer.
+    /// For k <= 16 with L2, caller must provide scratchBuf sized nq*nv*sizeof(float)
+    /// for the negated distance copy. Pass nil if metric is IP or k > 16.
+    void encode(
+            id<MTLCommandBuffer> cmdBuf,
+            id<MTLBuffer> distances,
+            id<MTLBuffer> outDistances,
+            id<MTLBuffer> outIndices,
+            id<MTLBuffer> mpsOutDistBuf,
+            id<MTLBuffer> mpsOutIdxBuf,
+            id<MTLBuffer> mpsNegateBuf,
+            size_t nq,
+            size_t nv,
+            size_t k,
+            faiss::MetricType metric);
+
+    /// Convenience: create command buffer, encode, commit, wait.
     void select(
             id<MTLBuffer> distances,
             id<MTLBuffer> outDistances,
@@ -30,6 +47,7 @@ class MetalSelect {
 
    private:
     MetalResources* resources_;
+    size_t blockSelectThreads_; // 256 default, 512 on M3+ (dynamic threadgroup mem)
 
     id<MTLComputePipelineState> blockSelectMinPipeline_;
     id<MTLComputePipelineState> blockSelectMaxPipeline_;

@@ -14,12 +14,16 @@ class MetalL2Norm {
    public:
     MetalL2Norm(MetalResources* resources);
 
-    /// Compute squared L2 norms.
-    /// @param input   MTLBuffer containing (n x d) float matrix
-    /// @param output  MTLBuffer for n floats (preallocated)
-    /// @param n       Number of rows
-    /// @param d       Dimension
-    /// @param queue   Command queue to use
+    /// Encode norm computation into an existing command buffer (no commit/wait).
+    /// Caller is responsible for committing the command buffer.
+    void encode(
+            id<MTLCommandBuffer> cmdBuf,
+            id<MTLBuffer> input,
+            id<MTLBuffer> output,
+            size_t n,
+            size_t d);
+
+    /// Convenience: create command buffer, encode, commit, wait.
     void compute(
             id<MTLBuffer> input,
             id<MTLBuffer> output,

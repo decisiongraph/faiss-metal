@@ -39,22 +39,19 @@ MetalL2Norm::MetalL2Norm(MetalResources* resources) {
     }
 }
 
-void MetalL2Norm::compute(
+void MetalL2Norm::encode(
+        id<MTLCommandBuffer> cmdBuf,
         id<MTLBuffer> input,
         id<MTLBuffer> output,
         size_t n,
-        size_t d,
-        id<MTLCommandQueue> queue) {
+        size_t d) {
 
     if (n == 0) return;
 
-    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
-
     uint32_t dim = (uint32_t)d;
 
     if (d <= 1024) {
-        // Simple path: one SIMD group (32 threads) per row
         auto pso = useFP16_ ? pipelineF16_ : pipeline_;
         [encoder setComputePipelineState:pso];
         [encoder setBuffer:input offset:0 atIndex:0];
@@ -63,7 +60,6 @@ void MetalL2Norm::compute(
         [encoder dispatchThreadgroups:MTLSizeMake(n, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     } else {
-        // Large dim: multiple SIMD groups per row
         size_t threadsPerGroup = std::min((size_t)1024, ((d + 31) / 32) * 32);
         auto pso = useFP16_ ? pipelineF16Large_ : pipelineLarge_;
         [encoder setComputePipelineState:pso];
@@ -75,6 +71,19 @@ void MetalL2Norm::compute(
     }
 
     [encoder endEncoding];
+}
+
+void MetalL2Norm::compute(
+        id<MTLBuffer> input,
+        id<MTLBuffer> output,
+        size_t n,
+        size_t d,
+        id<MTLCommandQueue> queue) {
+
+    if (n == 0) return;
+
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    encode(cmdBuf, input, output, n, d);
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
 }

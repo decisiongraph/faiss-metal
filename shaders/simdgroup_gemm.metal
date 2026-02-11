@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#include "GemmParams.h"
 using namespace metal;
 
 /// Half-precision GEMM using simdgroup_matrix_multiply_accumulate.
@@ -19,14 +20,6 @@ constant uint BM = 32;
 constant uint BN = 32;
 constant uint BK = 32;
 constant uint SIMD_TILE = 8;
-
-struct GemmParams {
-    uint M;       // rows of A / rows of C
-    uint N;       // rows of B / cols of C  (B is transposed)
-    uint K;       // cols of A / cols of B
-    float alpha;
-    float beta;
-};
 
 /// Float32-input variant: casts to half on load for simdgroup_matrix,
 /// accumulates in half, outputs float32. Slight precision loss but 2x throughput.

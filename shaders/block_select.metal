@@ -49,6 +49,8 @@ kernel void block_select_min(
     device int32_t* out_indices [[buffer(2)]],      // (nq x k)
     constant uint& nv [[buffer(3)]],
     constant uint& k [[buffer(4)]],
+    threadgroup float* shared_dist [[threadgroup(0)]],
+    threadgroup int32_t* shared_idx [[threadgroup(1)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]) {
@@ -87,9 +89,6 @@ kernel void block_select_min(
     // Sort each thread's local buffer so the merge can early-exit
     sort_local_asc(local_dist, local_idx, local_count);
 
-    threadgroup float shared_dist[256 * LOCAL_K];
-    threadgroup int32_t shared_idx[256 * LOCAL_K];
-
     uint base = tid * LOCAL_K;
     for (uint i = 0; i < local_count; i++) {
         shared_dist[base + i] = local_dist[i];
@@ -106,8 +105,6 @@ kernel void block_select_min(
         device float* out_d = out_distances + row * k;
         device int32_t* out_i = out_indices + row * k;
 
-        // Track current position in each thread's sorted buffer
-        // Use simple repeated-minimum approach but skip INFINITY entries
         uint total_candidates = tg_size * LOCAL_K;
 
         for (uint ki = 0; ki < k; ki++) {
@@ -120,7 +117,6 @@ kernel void block_select_min(
                 }
             }
             if (best_d == INFINITY) {
-                // No more valid candidates
                 for (uint fill = ki; fill < k; fill++) {
                     out_d[fill] = INFINITY;
                     out_i[fill] = -1;
@@ -140,6 +136,8 @@ kernel void block_select_max(
     device int32_t* out_indices [[buffer(2)]],
     constant uint& nv [[buffer(3)]],
     constant uint& k [[buffer(4)]],
+    threadgroup float* shared_dist [[threadgroup(0)]],
+    threadgroup int32_t* shared_idx [[threadgroup(1)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint tg_size [[threads_per_threadgroup]]) {
@@ -176,9 +174,6 @@ kernel void block_select_max(
     }
 
     sort_local_desc(local_dist, local_idx, local_count);
-
-    threadgroup float shared_dist[256 * LOCAL_K];
-    threadgroup int32_t shared_idx[256 * LOCAL_K];
 
     uint base = tid * LOCAL_K;
     for (uint i = 0; i < local_count; i++) {

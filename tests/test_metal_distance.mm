@@ -229,9 +229,115 @@ static void test_ip_distance() {
     printf("PASS\n");
 }
 
+/// Test forced MPS path on M2+ hardware (exercises both code paths)
+static void test_forced_mps_l2() {
+    printf("test_forced_mps_l2... ");
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalDistance distCalc(res.get());
+    MetalDistance distCalcMPS(res.get());
+    distCalcMPS.setForceMPS(true);
+    MetalL2Norm normCalc(res.get());
+
+    const size_t nq = 5;
+    const size_t nv = 50;
+    const size_t d = 64;
+
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> queries(nq * d);
+    std::vector<float> vectors(nv * d);
+    for (auto& v : queries) v = dist(rng);
+    for (auto& v : vectors) v = dist(rng);
+
+    id<MTLDevice> device = res->getDevice();
+    id<MTLCommandQueue> queue = res->getDefaultCommandQueue();
+
+    id<MTLBuffer> queryBuf = [device newBufferWithBytes:queries.data()
+                                                length:nq * d * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vecBuf = [device newBufferWithBytes:vectors.data()
+                                              length:nv * d * sizeof(float)
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> normBuf = [device newBufferWithLength:nv * sizeof(float)
+                                                options:MTLResourceStorageModeShared];
+    id<MTLBuffer> distBuf1 = [device newBufferWithLength:nq * nv * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> distBuf2 = [device newBufferWithLength:nq * nv * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+
+    normCalc.compute(vecBuf, normBuf, nv, d, queue);
+
+    // Default path (simdgroup on M2+, MPS on M1)
+    distCalc.compute(queryBuf, vecBuf, normBuf, distBuf1,
+                     nq, nv, d, faiss::METRIC_L2, queue);
+    // Forced MPS path
+    distCalcMPS.compute(queryBuf, vecBuf, normBuf, distBuf2,
+                        nq, nv, d, faiss::METRIC_L2, queue);
+
+    float* d1 = (float*)[distBuf1 contents];
+    float* d2 = (float*)[distBuf2 contents];
+
+    // Both paths should agree within tolerance
+    for (size_t i = 0; i < nq * nv; i++) {
+        float relDiff = std::abs(d1[i] - d2[i]) / std::max(std::abs(d1[i]), 1e-6f);
+        assert(relDiff < 5e-2f && "Default vs forced-MPS L2 mismatch");
+    }
+
+    printf("PASS\n");
+}
+
+static void test_forced_mps_ip() {
+    printf("test_forced_mps_ip... ");
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalDistance distCalc(res.get());
+    MetalDistance distCalcMPS(res.get());
+    distCalcMPS.setForceMPS(true);
+
+    const size_t nq = 5;
+    const size_t nv = 50;
+    const size_t d = 64;
+
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> queries(nq * d);
+    std::vector<float> vectors(nv * d);
+    for (auto& v : queries) v = dist(rng);
+    for (auto& v : vectors) v = dist(rng);
+
+    id<MTLDevice> device = res->getDevice();
+    id<MTLCommandQueue> queue = res->getDefaultCommandQueue();
+
+    id<MTLBuffer> queryBuf = [device newBufferWithBytes:queries.data()
+                                                length:nq * d * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+    id<MTLBuffer> vecBuf = [device newBufferWithBytes:vectors.data()
+                                              length:nv * d * sizeof(float)
+                                             options:MTLResourceStorageModeShared];
+    id<MTLBuffer> distBuf1 = [device newBufferWithLength:nq * nv * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> distBuf2 = [device newBufferWithLength:nq * nv * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+
+    distCalc.compute(queryBuf, vecBuf, nil, distBuf1,
+                     nq, nv, d, faiss::METRIC_INNER_PRODUCT, queue);
+    distCalcMPS.compute(queryBuf, vecBuf, nil, distBuf2,
+                        nq, nv, d, faiss::METRIC_INNER_PRODUCT, queue);
+
+    float* d1 = (float*)[distBuf1 contents];
+    float* d2 = (float*)[distBuf2 contents];
+
+    for (size_t i = 0; i < nq * nv; i++) {
+        float relDiff = std::abs(d1[i] - d2[i]) / std::max(std::abs(d1[i]), 1e-6f);
+        assert(relDiff < 5e-2f && "Default vs forced-MPS IP mismatch");
+    }
+
+    printf("PASS\n");
+}
+
 int main() {
     @autoreleasepool {
-        // Print device info
         auto res = std::make_shared<StandardMetalResources>();
         const auto& caps = res->getCapabilities();
         printf("=== Metal Distance Tests ===\n");
@@ -241,6 +347,8 @@ int main() {
         test_l2_norm_large_dim();
         test_l2_distance();
         test_ip_distance();
+        test_forced_mps_l2();
+        test_forced_mps_ip();
         printf("All distance tests passed!\n");
     }
     return 0;

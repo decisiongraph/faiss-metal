@@ -12,14 +12,14 @@ namespace faiss_metal {
 template <typename T, int Dim>
 class MetalTensor {
    public:
-    MetalTensor() : buffer_(nil), numElements_(0) {
+    MetalTensor() : buffer_(nil), numElements_(0), isNoCopy_(false) {
         sizes_.fill(0);
         strides_.fill(0);
     }
 
     /// Allocate a new buffer on the given device
     MetalTensor(id<MTLDevice> device, std::array<size_t, Dim> sizes)
-            : sizes_(sizes) {
+            : sizes_(sizes), isNoCopy_(false) {
         computeStrides();
         numElements_ = computeNumElements();
         size_t bytes = numElements_ * sizeof(T);
@@ -28,12 +28,14 @@ class MetalTensor {
         FAISS_THROW_IF_NOT_MSG(buffer_, "Failed to allocate MTLBuffer");
     }
 
-    /// Wrap existing CPU pointer with zero-copy MTLBuffer (newBufferWithBytesNoCopy)
+    /// Wrap existing CPU pointer with zero-copy MTLBuffer (newBufferWithBytesNoCopy).
+    /// If the pointer is page-aligned, uses true zero-copy (isNoCopy() == true).
+    /// Otherwise falls back to allocate + copy (isNoCopy() == false).
     MetalTensor(
             id<MTLDevice> device,
             T* data,
             std::array<size_t, Dim> sizes)
-            : sizes_(sizes) {
+            : sizes_(sizes), isNoCopy_(false) {
         computeStrides();
         numElements_ = computeNumElements();
         size_t bytes = numElements_ * sizeof(T);
@@ -46,6 +48,7 @@ class MetalTensor {
                                      length:bytes
                                     options:MTLResourceStorageModeShared
                                 deallocator:nil];
+            if (buffer_) isNoCopy_ = true;
         }
         if (!buffer_) {
             // Fall back: allocate and copy
@@ -72,6 +75,9 @@ class MetalTensor {
 
     bool empty() const { return numElements_ == 0; }
 
+    /// True if buffer wraps external pointer via NoCopy (caller owns memory).
+    bool isNoCopy() const { return isNoCopy_; }
+
     /// Resize (reallocates if needed, does NOT preserve data)
     void resize(id<MTLDevice> device, std::array<size_t, Dim> newSizes) {
         sizes_ = newSizes;
@@ -79,6 +85,7 @@ class MetalTensor {
         size_t newNumElements = computeNumElements();
         if (newNumElements != numElements_ || !buffer_) {
             numElements_ = newNumElements;
+            isNoCopy_ = false;
             size_t bytes = numElements_ * sizeof(T);
             buffer_ = [device newBufferWithLength:bytes
                                           options:MTLResourceStorageModeShared];
@@ -108,6 +115,7 @@ class MetalTensor {
     std::array<size_t, Dim> sizes_;
     std::array<size_t, Dim> strides_;
     size_t numElements_;
+    bool isNoCopy_;
 };
 
 } // namespace faiss_metal

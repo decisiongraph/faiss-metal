@@ -26,6 +26,8 @@ struct MetalIndexFlat::Impl {
     id<MTLBuffer> scratchOutDistBuf = nil;
     id<MTLBuffer> scratchOutIdxBuf = nil;
     size_t scratchTopkElems = 0;
+    id<MTLBuffer> scratchQueryNormBuf = nil;
+    size_t scratchQueryNormElems = 0;
 
     id<MTLBuffer> getScratchDist(id<MTLDevice> device, size_t bytes) {
         if (bytes > scratchDistBytes) {
@@ -47,6 +49,15 @@ struct MetalIndexFlat::Impl {
         }
         outDist = scratchOutDistBuf;
         outIdx = scratchOutIdxBuf;
+    }
+
+    id<MTLBuffer> getScratchQueryNorms(id<MTLDevice> device, size_t nq) {
+        if (nq > scratchQueryNormElems) {
+            scratchQueryNormElems = nq;
+            scratchQueryNormBuf = [device newBufferWithLength:nq * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        }
+        return scratchQueryNormBuf;
     }
 
     Impl(std::shared_ptr<MetalResources> res)
@@ -158,16 +169,36 @@ void MetalIndexFlat::search(
     size_t distBytes = n * ntotal * sizeof(float);
     id<MTLBuffer> distBuf = impl_->getScratchDist(device, distBytes);
 
-    impl_->distance->compute(
-            queryBuf, vecBuf, normBuf, distBuf,
-            n, ntotal, d, metric_type, queue);
-
     id<MTLBuffer> outDistBuf, outIdxBuf;
     impl_->getScratchTopk(device, n * effective_k, outDistBuf, outIdxBuf);
 
-    impl_->selector->select(
-            distBuf, outDistBuf, outIdxBuf,
-            n, ntotal, effective_k, metric_type, queue);
+    if (effective_k > 16) {
+        // Single command buffer: distance + top-k in one GPU submission
+        id<MTLBuffer> queryNormsBuf = nil;
+        if (metric_type == faiss::METRIC_L2) {
+            queryNormsBuf = impl_->getScratchQueryNorms(device, n);
+        }
+
+        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+        impl_->distance->encode(
+                cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
+                distBuf, n, ntotal, d, metric_type);
+        impl_->selector->encode(
+                cmdBuf, distBuf, outDistBuf, outIdxBuf,
+                nil, nil, nil, n, ntotal, effective_k, metric_type);
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
+    } else {
+        // MPS TopK path (k <= 16): needs CPU post-processing for
+        // float→int32 index conversion and L2 distance un-negation.
+        // Uses two GPU submissions via convenience wrappers.
+        impl_->distance->compute(
+                queryBuf, vecBuf, normBuf, distBuf,
+                n, ntotal, d, metric_type, queue);
+        impl_->selector->select(
+                distBuf, outDistBuf, outIdxBuf,
+                n, ntotal, effective_k, metric_type, queue);
+    }
 
     // Copy results back
     float* outDistPtr = (float*)[outDistBuf contents];
@@ -199,6 +230,8 @@ void MetalIndexFlat::reset() {
     impl_->scratchOutDistBuf = nil;
     impl_->scratchOutIdxBuf = nil;
     impl_->scratchTopkElems = 0;
+    impl_->scratchQueryNormBuf = nil;
+    impl_->scratchQueryNormElems = 0;
 }
 
 void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {
@@ -210,6 +243,10 @@ void MetalIndexFlat::reconstruct(faiss::idx_t key, float* recons) const {
 
 const float* MetalIndexFlat::getVectorsData() const {
     return impl_->vectors.data();
+}
+
+void MetalIndexFlat::setForceMPS(bool force) {
+    impl_->distance->setForceMPS(force);
 }
 
 // --- Conversion helpers ---

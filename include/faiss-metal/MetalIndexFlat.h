@@ -37,6 +37,9 @@ class MetalIndexFlat : public faiss::Index {
     /// Direct access to stored vectors (CPU pointer into unified memory)
     const float* getVectorsData() const;
 
+    /// Force MPS GEMM path even on M2+ hardware. For testing both paths.
+    void setForceMPS(bool force);
+
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

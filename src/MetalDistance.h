@@ -25,7 +25,25 @@ class MetalDistance {
     MetalDistance(MetalResources* resources);
     ~MetalDistance();
 
-    /// Compute all-pairs distances between queries and database vectors.
+    /// Force MPS GEMM path even on M2+ hardware. For testing both paths.
+    void setForceMPS(bool force) { forceMPS_ = force; }
+
+    /// Encode distance computation into an existing command buffer.
+    /// For L2, also needs a scratch buffer for query norms (queryNormsBuf).
+    /// Caller is responsible for committing.
+    void encode(
+            id<MTLCommandBuffer> cmdBuf,
+            id<MTLBuffer> queries,
+            id<MTLBuffer> vectors,
+            id<MTLBuffer> vecNorms,
+            id<MTLBuffer> queryNormsBuf,
+            id<MTLBuffer> distOutput,
+            size_t nq,
+            size_t nv,
+            size_t d,
+            faiss::MetricType metric);
+
+    /// Convenience: create command buffer, encode, commit, wait.
     void compute(
             id<MTLBuffer> queries,
             id<MTLBuffer> vectors,
@@ -40,23 +58,28 @@ class MetalDistance {
    private:
     MetalResources* resources_;
     bool useSimdGroupGemm_; // M2+: use custom GEMM instead of MPS
+    bool forceMPS_ = false; // override: force MPS path for testing
     std::unique_ptr<MetalL2Norm> l2norm_; // reused across calls
 
     id<MTLComputePipelineState> broadcastSumPipeline_;
-    id<MTLComputePipelineState> simdgroupGemmPipeline_; // simdgroup_gemm_f32_via_f16
-    id<MTLComputePipelineState> directL2Pipeline_;      // l2_distance_direct_f16
+    id<MTLComputePipelineState> simdgroupGemmPipeline_;
+    id<MTLComputePipelineState> directL2Pipeline_;
 
-    void computeMPS(
+    void encodeMPS(
+            id<MTLCommandBuffer> cmdBuf,
             id<MTLBuffer> queries, id<MTLBuffer> vectors,
-            id<MTLBuffer> vecNorms, id<MTLBuffer> distOutput,
+            id<MTLBuffer> vecNorms, id<MTLBuffer> queryNormsBuf,
+            id<MTLBuffer> distOutput,
             size_t nq, size_t nv, size_t d,
-            faiss::MetricType metric, id<MTLCommandQueue> queue);
+            faiss::MetricType metric);
 
-    void computeSimdGroup(
+    void encodeSimdGroup(
+            id<MTLCommandBuffer> cmdBuf,
             id<MTLBuffer> queries, id<MTLBuffer> vectors,
-            id<MTLBuffer> vecNorms, id<MTLBuffer> distOutput,
+            id<MTLBuffer> vecNorms, id<MTLBuffer> queryNormsBuf,
+            id<MTLBuffer> distOutput,
             size_t nq, size_t nv, size_t d,
-            faiss::MetricType metric, id<MTLCommandQueue> queue);
+            faiss::MetricType metric);
 };
 
 } // namespace faiss_metal

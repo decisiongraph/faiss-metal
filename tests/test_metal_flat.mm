@@ -220,6 +220,45 @@ static void test_reconstruct() {
     printf("PASS\n");
 }
 
+static void test_forced_mps_search() {
+    printf("test_forced_mps_search (L2+IP via MPS path)... ");
+
+    const size_t nv = 500;
+    const size_t nq = 5;
+    const size_t d = 128;
+    const size_t k = 5;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> vectors(nv * d);
+    std::vector<float> queries(nq * d);
+    for (auto& v : vectors) v = dist(rng);
+    for (auto& v : queries) v = dist(rng);
+
+    // CPU reference
+    faiss::IndexFlatL2 cpu_index(d);
+    cpu_index.add(nv, vectors.data());
+    std::vector<float> cpu_distances(nq * k);
+    std::vector<faiss::idx_t> cpu_labels(nq * k);
+    cpu_index.search(nq, queries.data(), k, cpu_distances.data(), cpu_labels.data());
+
+    // Metal with forced MPS path
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, d, faiss::METRIC_L2);
+    metal_index.setForceMPS(true);
+    metal_index.add(nv, vectors.data());
+
+    std::vector<float> metal_distances(nq * k);
+    std::vector<faiss::idx_t> metal_labels(nq * k);
+    metal_index.search(nq, queries.data(), k, metal_distances.data(), metal_labels.data());
+
+    compare_results("ForcedMPS-L2", nq, k,
+                    metal_distances.data(), metal_labels.data(),
+                    cpu_distances.data(), cpu_labels.data());
+
+    printf("PASS\n");
+}
+
 int main() {
     @autoreleasepool {
         auto res = std::make_shared<StandardMetalResources>();
@@ -243,6 +282,9 @@ int main() {
 
         // Edge cases
         test_flat_l2(100, 1, 32, 1);   // single query, k=1
+
+        // Forced MPS path (tests both code paths on M2+)
+        test_forced_mps_search();
 
         // Conversion
         test_conversion();

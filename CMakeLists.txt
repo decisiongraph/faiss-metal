@@ -22,7 +22,7 @@ foreach(METAL_SRC ${METAL_SOURCES})
     set(AIR_FILE ${CMAKE_BINARY_DIR}/${METAL_NAME}.air)
     add_custom_command(
         OUTPUT ${AIR_FILE}
-        COMMAND xcrun -sdk macosx metal -std=metal3.0 -c ${METAL_SRC} -o ${AIR_FILE}
+        COMMAND xcrun -sdk macosx metal -std=metal3.0 -I ${CMAKE_SOURCE_DIR}/shaders -c ${METAL_SRC} -o ${AIR_FILE}
         DEPENDS ${METAL_SRC}
         COMMENT "Compiling ${METAL_NAME}.metal → .air"
     )
@@ -56,6 +56,7 @@ target_include_directories(faiss_metal
         ${CMAKE_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/shaders
 )
 
 target_link_libraries(faiss_metal
