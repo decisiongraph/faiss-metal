@@ -338,15 +338,18 @@ bool MetalDistance::encodeFused(
         size_t k,
         faiss::MetricType metric) {
 
-    // Fused path: beneficial when nq is small (avoids nq*nv intermediate buffer).
-    // For nq > 4, the GEMM path is better due to query batching (BM=32 amortization).
-    // Requires k <= 32 (warp_select constraint).
+    // Fused path: eliminates the nq*nv intermediate distance buffer by computing
+    // distances on-the-fly with warp_select. Only beneficial when that buffer
+    // would be large (>32MB), since the fused kernel scans vectors sequentially
+    // and is slower per-element than the tiled GEMM path.
+    // Requires k <= 32 (warp_select constraint) and nq <= 4 (no query batching).
     if (nq == 0 || nv == 0 || k == 0 || k > 32 || nq > 4) {
         return false;
     }
 
-    // For very small nv, the direct L2 path or GEMM path is already fast enough
-    if (nv <= 256) {
+    // Only fuse when intermediate buffer would exceed ~32MB.
+    // Below that, GEMM + separate select is faster (better compute efficiency).
+    if (nq * nv < 8'000'000) {
         return false;
     }
 
