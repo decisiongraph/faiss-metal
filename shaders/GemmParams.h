@@ -16,3 +16,12 @@ struct GemmParams {
     float alpha;
     float beta;
 };
+
+/// Extended params for fused GEMM + L2 norm broadcast.
+/// C[i][j] = alpha * (A * B^T)[i][j] + row_norms[i] + col_norms[j]
+struct GemmL2Params {
+    uint32 M;
+    uint32 N;
+    uint32 K;
+    float alpha;    // -2.0 for L2
+};

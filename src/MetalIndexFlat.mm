@@ -172,33 +172,22 @@ void MetalIndexFlat::search(
     id<MTLBuffer> outDistBuf, outIdxBuf;
     impl_->getScratchTopk(device, n * effective_k, outDistBuf, outIdxBuf);
 
-    if (effective_k > 16) {
-        // Single command buffer: distance + top-k in one GPU submission
-        id<MTLBuffer> queryNormsBuf = nil;
-        if (metric_type == faiss::METRIC_L2) {
-            queryNormsBuf = impl_->getScratchQueryNorms(device, n);
-        }
-
-        id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
-        impl_->distance->encode(
-                cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
-                distBuf, n, ntotal, d, metric_type);
-        impl_->selector->encode(
-                cmdBuf, distBuf, outDistBuf, outIdxBuf,
-                nil, nil, nil, n, ntotal, effective_k, metric_type);
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
-    } else {
-        // MPS TopK path (k <= 16): needs CPU post-processing for
-        // float→int32 index conversion and L2 distance un-negation.
-        // Uses two GPU submissions via convenience wrappers.
-        impl_->distance->compute(
-                queryBuf, vecBuf, normBuf, distBuf,
-                n, ntotal, d, metric_type, queue);
-        impl_->selector->select(
-                distBuf, outDistBuf, outIdxBuf,
-                n, ntotal, effective_k, metric_type, queue);
+    // Single command buffer: distance + top-k in one GPU submission.
+    // All k values use GPU-native selection (no MPS, no CPU fallback).
+    id<MTLBuffer> queryNormsBuf = nil;
+    if (metric_type == faiss::METRIC_L2) {
+        queryNormsBuf = impl_->getScratchQueryNorms(device, n);
     }
+
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+    impl_->distance->encode(
+            cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
+            distBuf, n, ntotal, d, metric_type);
+    impl_->selector->encode(
+            cmdBuf, distBuf, outDistBuf, outIdxBuf,
+            nil, nil, nil, n, ntotal, effective_k, metric_type);
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
 
     // Copy results back
     float* outDistPtr = (float*)[outDistBuf contents];

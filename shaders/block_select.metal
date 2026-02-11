@@ -4,15 +4,16 @@ using namespace metal;
 /// Block-level top-k selection for k > 32.
 /// Each threadgroup processes one query row.
 ///
-/// Each thread scans a stripe, keeps LOCAL_K best in a sorted buffer,
-/// then all threads write to shared memory for a final merge.
+/// Phase 1: Each thread scans a stripe, keeps LOCAL_K best in a sorted buffer.
+/// Phase 2: Parallel pairwise merge reduction in shared memory.
+/// Phase 3: Thread 0 extracts final top-k from merged result.
 ///
-/// Dispatch: threadgroups = nq, threads_per_threadgroup = 256
-/// k must be <= 2048
+/// Dispatch: threadgroups = nq, threads_per_threadgroup = 256 (or 512 on M3+)
+/// k must be <= LOCAL_K * threads_per_threadgroup
 
 #define LOCAL_K 8
 
-// Insertion sort a small buffer (ascending order for min, descending for max)
+// Insertion sort a small buffer (ascending for min)
 inline void sort_local_asc(thread float* dist, thread int32_t* idx, uint count) {
     for (uint i = 1; i < count; i++) {
         float d = dist[i];
@@ -43,6 +44,70 @@ inline void sort_local_desc(thread float* dist, thread int32_t* idx, uint count)
     }
 }
 
+/// Merge two sorted runs of LOCAL_K elements in shared memory (ascending).
+/// Each thread in pair handles one side. Winner keeps best LOCAL_K from both.
+inline void merge_pair_asc(
+    threadgroup float* shared_dist,
+    threadgroup int32_t* shared_idx,
+    uint my_base,
+    uint other_base)
+{
+    // Two-pointer merge: both runs are sorted ascending.
+    // Keep the smallest LOCAL_K from 2*LOCAL_K candidates.
+    float merged_d[LOCAL_K];
+    int32_t merged_i[LOCAL_K];
+    uint a = 0, b = 0;
+
+    for (uint out = 0; out < LOCAL_K; out++) {
+        float da = (a < LOCAL_K) ? shared_dist[my_base + a] : INFINITY;
+        float db = (b < LOCAL_K) ? shared_dist[other_base + b] : INFINITY;
+        if (da <= db) {
+            merged_d[out] = da;
+            merged_i[out] = shared_idx[my_base + a];
+            a++;
+        } else {
+            merged_d[out] = db;
+            merged_i[out] = shared_idx[other_base + b];
+            b++;
+        }
+    }
+
+    for (uint i = 0; i < LOCAL_K; i++) {
+        shared_dist[my_base + i] = merged_d[i];
+        shared_idx[my_base + i] = merged_i[i];
+    }
+}
+
+inline void merge_pair_desc(
+    threadgroup float* shared_dist,
+    threadgroup int32_t* shared_idx,
+    uint my_base,
+    uint other_base)
+{
+    float merged_d[LOCAL_K];
+    int32_t merged_i[LOCAL_K];
+    uint a = 0, b = 0;
+
+    for (uint out = 0; out < LOCAL_K; out++) {
+        float da = (a < LOCAL_K) ? shared_dist[my_base + a] : -INFINITY;
+        float db = (b < LOCAL_K) ? shared_dist[other_base + b] : -INFINITY;
+        if (da >= db) {
+            merged_d[out] = da;
+            merged_i[out] = shared_idx[my_base + a];
+            a++;
+        } else {
+            merged_d[out] = db;
+            merged_i[out] = shared_idx[other_base + b];
+            b++;
+        }
+    }
+
+    for (uint i = 0; i < LOCAL_K; i++) {
+        shared_dist[my_base + i] = merged_d[i];
+        shared_idx[my_base + i] = merged_i[i];
+    }
+}
+
 kernel void block_select_min(
     device const float* distances [[buffer(0)]],   // (nq x nv)
     device float* out_distances [[buffer(1)]],      // (nq x k)
@@ -62,6 +127,7 @@ kernel void block_select_min(
 
     device const float* row_data = distances + row * nv;
 
+    // Phase 1: Each thread scans its stripe, keeping LOCAL_K best
     for (uint i = tid; i < nv; i += tg_size) {
         float d = row_data[i];
         if (local_count < LOCAL_K) {
@@ -86,7 +152,6 @@ kernel void block_select_min(
         }
     }
 
-    // Sort each thread's local buffer so the merge can early-exit
     sort_local_asc(local_dist, local_idx, local_count);
 
     uint base = tid * LOCAL_K;
@@ -100,32 +165,29 @@ kernel void block_select_min(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Thread 0: k-way merge from sorted per-thread buffers
+    // Phase 2: Parallel pairwise merge reduction.
+    // Each round, thread i merges with thread i+stride, halving active threads.
+    for (uint stride = 1; stride < tg_size; stride *= 2) {
+        if ((tid % (stride * 2)) == 0 && (tid + stride) < tg_size) {
+            uint my_base = tid * LOCAL_K;
+            uint other_base = (tid + stride) * LOCAL_K;
+            merge_pair_asc(shared_dist, shared_idx, my_base, other_base);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 3: Thread 0 writes final top-k from merged result (already sorted)
     if (tid == 0) {
         device float* out_d = out_distances + row * k;
         device int32_t* out_i = out_indices + row * k;
-
-        uint total_candidates = tg_size * LOCAL_K;
-
-        for (uint ki = 0; ki < k; ki++) {
-            float best_d = INFINITY;
-            uint best_pos = 0;
-            for (uint j = 0; j < total_candidates; j++) {
-                if (shared_dist[j] < best_d) {
-                    best_d = shared_dist[j];
-                    best_pos = j;
-                }
-            }
-            if (best_d == INFINITY) {
-                for (uint fill = ki; fill < k; fill++) {
-                    out_d[fill] = INFINITY;
-                    out_i[fill] = -1;
-                }
-                break;
-            }
-            out_d[ki] = best_d;
-            out_i[ki] = shared_idx[best_pos];
-            shared_dist[best_pos] = INFINITY;
+        uint count = min(k, (uint)LOCAL_K);
+        for (uint i = 0; i < count; i++) {
+            out_d[i] = shared_dist[i];
+            out_i[i] = shared_idx[i];
+        }
+        for (uint i = count; i < k; i++) {
+            out_d[i] = INFINITY;
+            out_i[i] = -1;
         }
     }
 }
@@ -186,31 +248,27 @@ kernel void block_select_max(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Parallel pairwise merge reduction
+    for (uint stride = 1; stride < tg_size; stride *= 2) {
+        if ((tid % (stride * 2)) == 0 && (tid + stride) < tg_size) {
+            uint my_base = tid * LOCAL_K;
+            uint other_base = (tid + stride) * LOCAL_K;
+            merge_pair_desc(shared_dist, shared_idx, my_base, other_base);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     if (tid == 0) {
         device float* out_d = out_distances + row * k;
         device int32_t* out_i = out_indices + row * k;
-
-        uint total_candidates = tg_size * LOCAL_K;
-
-        for (uint ki = 0; ki < k; ki++) {
-            float best_d = -INFINITY;
-            uint best_pos = 0;
-            for (uint j = 0; j < total_candidates; j++) {
-                if (shared_dist[j] > best_d) {
-                    best_d = shared_dist[j];
-                    best_pos = j;
-                }
-            }
-            if (best_d == -INFINITY) {
-                for (uint fill = ki; fill < k; fill++) {
-                    out_d[fill] = -INFINITY;
-                    out_i[fill] = -1;
-                }
-                break;
-            }
-            out_d[ki] = best_d;
-            out_i[ki] = shared_idx[best_pos];
-            shared_dist[best_pos] = -INFINITY;
+        uint count = min(k, (uint)LOCAL_K);
+        for (uint i = 0; i < count; i++) {
+            out_d[i] = shared_dist[i];
+            out_i[i] = shared_idx[i];
+        }
+        for (uint i = count; i < k; i++) {
+            out_d[i] = -INFINITY;
+            out_i[i] = -1;
         }
     }
 }

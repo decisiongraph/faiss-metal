@@ -63,6 +63,7 @@ class MetalDistance {
 
     id<MTLComputePipelineState> broadcastSumPipeline_;
     id<MTLComputePipelineState> simdgroupGemmPipeline_;
+    id<MTLComputePipelineState> simdgroupGemmL2FusedPipeline_;
     id<MTLComputePipelineState> directL2Pipeline_;
 
     void encodeMPS(

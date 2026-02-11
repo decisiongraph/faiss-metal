@@ -29,6 +29,11 @@ MetalDistance::MetalDistance(MetalResources* resources)
         simdgroupGemmPipeline_ = [device newComputePipelineStateWithFunction:gemmFn error:&error];
         FAISS_THROW_IF_NOT_MSG(simdgroupGemmPipeline_, "Failed to create simdgroup_gemm pipeline");
 
+        id<MTLFunction> fusedFn = [lib newFunctionWithName:@"simdgroup_gemm_l2_fused"];
+        FAISS_THROW_IF_NOT_MSG(fusedFn, "Metal function 'simdgroup_gemm_l2_fused' not found");
+        simdgroupGemmL2FusedPipeline_ = [device newComputePipelineStateWithFunction:fusedFn error:&error];
+        FAISS_THROW_IF_NOT_MSG(simdgroupGemmL2FusedPipeline_, "Failed to create fused L2 GEMM pipeline");
+
         id<MTLFunction> directFn = [lib newFunctionWithName:@"l2_distance_direct_f16"];
         FAISS_THROW_IF_NOT_MSG(directFn, "Metal function 'l2_distance_direct_f16' not found");
         directL2Pipeline_ = [device newComputePipelineStateWithFunction:directFn error:&error];
@@ -183,14 +188,32 @@ void MetalDistance::encodeSimdGroup(
         return;
     }
 
-    // GEMM: Q * V^T (or -2*Q*V^T for L2)
-    float alpha = (metric == faiss::METRIC_L2) ? -2.0f : 1.0f;
-    GemmParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, alpha, 0.0f};
-
     size_t gridX = (nv + 31) / 32;
     size_t gridY = (nq + 31) / 32;
 
-    {
+    if (metric == faiss::METRIC_L2) {
+        // Fused path: compute query norms first, then single GEMM kernel
+        // that adds row_norms[i] + col_norms[j] in its epilogue.
+        // Eliminates separate broadcast_sum dispatch.
+        l2norm_->encode(cmdBuf, queries, queryNormsBuf, nq, d);
+
+        GemmL2Params params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, -2.0f};
+
+        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
+        [enc setComputePipelineState:simdgroupGemmL2FusedPipeline_];
+        [enc setBuffer:queries offset:0 atIndex:0];
+        [enc setBuffer:vectors offset:0 atIndex:1];
+        [enc setBuffer:distOutput offset:0 atIndex:2];
+        [enc setBytes:&params length:sizeof(params) atIndex:3];
+        [enc setBuffer:queryNormsBuf offset:0 atIndex:4];
+        [enc setBuffer:vecNorms offset:0 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+        [enc endEncoding];
+    } else {
+        // Inner product: plain GEMM
+        GemmParams params{(uint32_t)nq, (uint32_t)nv, (uint32_t)d, 1.0f, 0.0f};
+
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
         [enc setComputePipelineState:simdgroupGemmPipeline_];
         [enc setBuffer:queries offset:0 atIndex:0];
@@ -199,25 +222,6 @@ void MetalDistance::encodeSimdGroup(
         [enc setBytes:&params length:sizeof(params) atIndex:3];
         [enc dispatchThreadgroups:MTLSizeMake(gridX, gridY, 1)
             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-        [enc endEncoding];
-    }
-
-    if (metric == faiss::METRIC_L2) {
-        // Encode norms (creates its own compute encoder inside)
-        l2norm_->encode(cmdBuf, queries, queryNormsBuf, nq, d);
-
-        // Encode broadcast_sum
-        uint32_t nv32 = (uint32_t)nv;
-        id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
-        [enc setComputePipelineState:broadcastSumPipeline_];
-        [enc setBuffer:distOutput offset:0 atIndex:0];
-        [enc setBuffer:queryNormsBuf offset:0 atIndex:1];
-        [enc setBuffer:vecNorms offset:0 atIndex:2];
-        [enc setBytes:&nv32 length:sizeof(nv32) atIndex:3];
-        MTLSize gridSize = MTLSizeMake(nv, nq, 1);
-        MTLSize groupSize = MTLSizeMake(std::min((size_t)256, nv),
-                                        std::min((size_t)4, nq), 1);
-        [enc dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
         [enc endEncoding];
     }
 }
