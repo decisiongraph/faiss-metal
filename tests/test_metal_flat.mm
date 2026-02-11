@@ -306,6 +306,161 @@ static void test_forced_mps_search() {
     printf("PASS\n");
 }
 
+static void test_search_async() {
+    printf("test_search_async (results match sync)... ");
+
+    const size_t nv = 1000;
+    const size_t nq = 10;
+    const size_t d = 128;
+    const size_t k = 10;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> vectors(nv * d);
+    std::vector<float> queries(nq * d);
+    for (auto& v : vectors) v = dist(rng);
+    for (auto& v : queries) v = dist(rng);
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, d, faiss::METRIC_L2);
+    metal_index.add(nv, vectors.data());
+
+    // Sync reference
+    std::vector<float> sync_distances(nq * k);
+    std::vector<faiss::idx_t> sync_labels(nq * k);
+    metal_index.search(nq, queries.data(), k, sync_distances.data(), sync_labels.data());
+
+    // Async
+    std::vector<float> async_distances(nq * k);
+    std::vector<faiss::idx_t> async_labels(nq * k);
+    auto token = metal_index.searchAsync(nq, queries.data(), k,
+                                          async_distances.data(), async_labels.data());
+    token.wait();
+
+    // Results must match exactly (same GPU, same buffers, deterministic)
+    for (size_t i = 0; i < nq * k; i++) {
+        assert(async_labels[i] == sync_labels[i] && "Async label mismatch");
+        assert(async_distances[i] == sync_distances[i] && "Async distance mismatch");
+    }
+
+    printf("PASS\n");
+}
+
+static void test_search_async_multiple() {
+    printf("test_search_async_multiple (concurrent tokens)... ");
+
+    const size_t nv = 1000;
+    const size_t nq = 5;
+    const size_t d = 128;
+    const size_t k = 5;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> vectors(nv * d);
+    for (auto& v : vectors) v = dist(rng);
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, d, faiss::METRIC_L2);
+    metal_index.add(nv, vectors.data());
+
+    // Launch 3 async searches with different queries
+    std::vector<float> q1(nq * d), q2(nq * d), q3(nq * d);
+    for (auto& v : q1) v = dist(rng);
+    for (auto& v : q2) v = dist(rng);
+    for (auto& v : q3) v = dist(rng);
+
+    std::vector<float> d1(nq * k), d2(nq * k), d3(nq * k);
+    std::vector<faiss::idx_t> l1(nq * k), l2(nq * k), l3(nq * k);
+
+    auto t1 = metal_index.searchAsync(nq, q1.data(), k, d1.data(), l1.data());
+    auto t2 = metal_index.searchAsync(nq, q2.data(), k, d2.data(), l2.data());
+    auto t3 = metal_index.searchAsync(nq, q3.data(), k, d3.data(), l3.data());
+
+    // Wait in reverse order
+    t3.wait();
+    t2.wait();
+    t1.wait();
+
+    // Verify against sync results
+    for (int batch = 0; batch < 3; batch++) {
+        const float* q = (batch == 0) ? q1.data() : (batch == 1) ? q2.data() : q3.data();
+        float* ad = (batch == 0) ? d1.data() : (batch == 1) ? d2.data() : d3.data();
+        faiss::idx_t* al = (batch == 0) ? l1.data() : (batch == 1) ? l2.data() : l3.data();
+
+        std::vector<float> sd(nq * k);
+        std::vector<faiss::idx_t> sl(nq * k);
+        metal_index.search(nq, q, k, sd.data(), sl.data());
+
+        for (size_t i = 0; i < nq * k; i++) {
+            assert(al[i] == sl[i] && "Concurrent async label mismatch");
+            assert(ad[i] == sd[i] && "Concurrent async distance mismatch");
+        }
+    }
+
+    printf("PASS\n");
+}
+
+static void test_search_async_isready() {
+    printf("test_search_async_isready... ");
+
+    const size_t nv = 1000;
+    const size_t d = 128;
+    const size_t k = 5;
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> vectors(nv * d);
+    std::vector<float> query(d);
+    for (auto& v : vectors) v = dist(rng);
+    for (auto& v : query) v = dist(rng);
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, d, faiss::METRIC_L2);
+    metal_index.add(nv, vectors.data());
+
+    std::vector<float> dists(k);
+    std::vector<faiss::idx_t> labels(k);
+    auto token = metal_index.searchAsync(1, query.data(), k, dists.data(), labels.data());
+
+    // Poll until ready (should finish quickly for small workload)
+    while (!token.isReady()) {
+        // spin
+    }
+    token.wait();
+
+    // Sanity: labels should be valid
+    for (size_t i = 0; i < (size_t)k; i++) {
+        assert(labels[i] >= 0 && labels[i] < (faiss::idx_t)nv);
+    }
+
+    printf("PASS\n");
+}
+
+static void test_search_async_empty() {
+    printf("test_search_async_empty (n=0 and ntotal=0)... ");
+
+    auto res = std::make_shared<StandardMetalResources>();
+    MetalIndexFlat metal_index(res, 32, faiss::METRIC_L2);
+
+    // ntotal=0 case
+    std::vector<float> query(32, 1.0f);
+    std::vector<float> dists(5);
+    std::vector<faiss::idx_t> labels(5);
+    auto t1 = metal_index.searchAsync(1, query.data(), 5, dists.data(), labels.data());
+    t1.wait();
+    for (int i = 0; i < 5; i++) {
+        assert(dists[i] == INFINITY);
+        assert(labels[i] == -1);
+    }
+
+    // n=0 case
+    auto t2 = metal_index.searchAsync(0, nullptr, 5, nullptr, nullptr);
+    assert(t2.isReady());
+    t2.wait();
+
+    printf("PASS\n");
+}
+
 int main() {
     @autoreleasepool {
         auto res = std::make_shared<StandardMetalResources>();
@@ -345,6 +500,12 @@ int main() {
 
         // Reconstruct
         test_reconstruct();
+
+        // Async search
+        test_search_async();
+        test_search_async_multiple();
+        test_search_async_isready();
+        test_search_async_empty();
 
         printf("All MetalIndexFlat tests passed!\n");
     }

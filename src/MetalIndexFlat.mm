@@ -7,9 +7,77 @@
 #import "MetalSelect.h"
 #import "MetalTensor.h"
 #include <faiss/impl/FaissAssert.h>
+#include <dispatch/dispatch.h>
 #include <cstring>
 
 namespace faiss_metal {
+
+// --- MetalSearchToken ---
+
+struct MetalSearchToken::Impl {
+    id<MTLCommandBuffer> cmdBuf;
+    id<MTLBuffer> outDistBuf;
+    id<MTLBuffer> outIdxBuf;
+    // Also hold refs to per-call buffers so they stay alive until wait()
+    id<MTLBuffer> queryBuf;
+    id<MTLBuffer> distBuf;       // may be nil (fused path)
+    id<MTLBuffer> queryNormBuf;  // may be nil (IP metric)
+
+    float* distances;
+    faiss::idx_t* labels;
+    faiss::idx_t n;
+    faiss::idx_t k;
+    faiss::idx_t effective_k;
+    faiss::MetricType metric_type;
+    bool waited = false;
+};
+
+MetalSearchToken::MetalSearchToken(std::unique_ptr<Impl> impl)
+        : impl_(std::move(impl)) {}
+
+MetalSearchToken::MetalSearchToken(MetalSearchToken&&) noexcept = default;
+MetalSearchToken& MetalSearchToken::operator=(MetalSearchToken&&) noexcept = default;
+
+MetalSearchToken::~MetalSearchToken() {
+    // If caller never called wait(), block now to ensure GPU is done
+    // before releasing buffers.
+    if (impl_ && !impl_->waited) {
+        [impl_->cmdBuf waitUntilCompleted];
+    }
+}
+
+void MetalSearchToken::wait() {
+    FAISS_THROW_IF_NOT_MSG(impl_, "MetalSearchToken: moved-from token");
+    if (impl_->waited) return;
+
+    [impl_->cmdBuf waitUntilCompleted];
+    impl_->waited = true;
+
+    // Copy results back (same logic as sync search)
+    float* outDistPtr = (float*)[impl_->outDistBuf contents];
+    int32_t* outIdxPtr = (int32_t*)[impl_->outIdxBuf contents];
+
+    float sentinel_dist = (impl_->metric_type == faiss::METRIC_L2) ? INFINITY : -INFINITY;
+
+    for (faiss::idx_t i = 0; i < impl_->n; i++) {
+        for (faiss::idx_t j = 0; j < impl_->effective_k; j++) {
+            impl_->distances[i * impl_->k + j] = outDistPtr[i * impl_->effective_k + j];
+            impl_->labels[i * impl_->k + j] = (faiss::idx_t)outIdxPtr[i * impl_->effective_k + j];
+        }
+        for (faiss::idx_t j = impl_->effective_k; j < impl_->k; j++) {
+            impl_->distances[i * impl_->k + j] = sentinel_dist;
+            impl_->labels[i * impl_->k + j] = -1;
+        }
+    }
+}
+
+bool MetalSearchToken::isReady() const {
+    FAISS_THROW_IF_NOT_MSG(impl_, "MetalSearchToken: moved-from token");
+    if (impl_->waited) return true;
+    return [impl_->cmdBuf status] == MTLCommandBufferStatusCompleted;
+}
+
+// --- MetalIndexFlat ---
 
 struct MetalIndexFlat::Impl {
     std::shared_ptr<MetalResources> resources;
@@ -151,21 +219,39 @@ void MetalIndexFlat::add(faiss::idx_t n, const float* x) {
         }
 
         // Convert float32 → reduced precision and store
+        // Parallelize with GCD for large adds (>100K elements)
+        size_t count = (size_t)n * d;
         if (impl_->useBFloat16Storage) {
             // BFloat16: truncate float32 mantissa (keep top 7 bits + 8-bit exponent)
             uint16_t* dst = (uint16_t*)[impl_->vectorsF16Buf contents] + ntotal * d;
             const uint32_t* src = (const uint32_t*)x;
-            for (size_t i = 0; i < (size_t)n * d; i++) {
-                // Standard float32→bfloat16: round-to-nearest-even
-                uint32_t bits = src[i];
-                uint32_t lsb = (bits >> 16) & 1;
-                uint32_t rounding = 0x7FFF + lsb;
-                dst[i] = (uint16_t)((bits + rounding) >> 16);
+            if (count > 100000) {
+                dispatch_apply(count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                    ^(size_t i) {
+                        uint32_t bits = src[i];
+                        uint32_t lsb = (bits >> 16) & 1;
+                        uint32_t rounding = 0x7FFF + lsb;
+                        dst[i] = (uint16_t)((bits + rounding) >> 16);
+                    });
+            } else {
+                for (size_t i = 0; i < count; i++) {
+                    uint32_t bits = src[i];
+                    uint32_t lsb = (bits >> 16) & 1;
+                    uint32_t rounding = 0x7FFF + lsb;
+                    dst[i] = (uint16_t)((bits + rounding) >> 16);
+                }
             }
         } else {
             __fp16* dst = (__fp16*)[impl_->vectorsF16Buf contents] + ntotal * d;
-            for (size_t i = 0; i < (size_t)n * d; i++) {
-                dst[i] = (__fp16)x[i];
+            if (count > 100000) {
+                dispatch_apply(count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                    ^(size_t i) {
+                        dst[i] = (__fp16)x[i];
+                    });
+            } else {
+                for (size_t i = 0; i < count; i++) {
+                    dst[i] = (__fp16)x[i];
+                }
             }
         }
 
@@ -312,6 +398,95 @@ void MetalIndexFlat::search(
             labels[i * k + j] = -1;
         }
     }
+}
+
+MetalSearchToken MetalIndexFlat::searchAsync(
+        faiss::idx_t n,
+        const float* x,
+        faiss::idx_t k,
+        float* distances,
+        faiss::idx_t* labels,
+        const faiss::SearchParameters* params) const {
+
+    FAISS_THROW_IF_NOT_MSG(k > 0, "k must be > 0");
+    FAISS_THROW_IF_NOT_MSG(
+            ntotal <= (faiss::idx_t)INT32_MAX,
+            "MetalIndexFlat supports at most 2^31-1 vectors (int32 indices)");
+
+    auto tokenImpl = std::make_unique<MetalSearchToken::Impl>();
+    tokenImpl->distances = distances;
+    tokenImpl->labels = labels;
+    tokenImpl->n = n;
+    tokenImpl->k = k;
+    tokenImpl->metric_type = metric_type;
+
+    if (n == 0 || ntotal == 0) {
+        // No GPU work — fill sentinel results immediately
+        float sentinel = (metric_type == faiss::METRIC_L2) ? INFINITY : -INFINITY;
+        for (faiss::idx_t i = 0; i < n * k; i++) {
+            distances[i] = sentinel;
+            labels[i] = -1;
+        }
+        tokenImpl->effective_k = 0;
+        tokenImpl->waited = true;
+        return MetalSearchToken(std::move(tokenImpl));
+    }
+
+    faiss::idx_t effective_k = std::min(k, (faiss::idx_t)ntotal);
+    tokenImpl->effective_k = effective_k;
+
+    id<MTLDevice> device = impl_->resources->getDevice();
+    id<MTLCommandQueue> queue = impl_->resources->getDefaultCommandQueue();
+
+    // Per-call buffers (not shared scratch)
+    id<MTLBuffer> queryBuf = [device
+            newBufferWithBytes:x
+                        length:n * d * sizeof(float)
+                       options:MTLResourceStorageModeShared];
+    tokenImpl->queryBuf = queryBuf;
+
+    id<MTLBuffer> vecBuf = impl_->getVectorsBuf();
+    id<MTLBuffer> normBuf = impl_->norms.buffer();
+
+    id<MTLBuffer> outDistBuf = [device newBufferWithLength:n * effective_k * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+    id<MTLBuffer> outIdxBuf = [device newBufferWithLength:n * effective_k * sizeof(int32_t)
+                                                   options:MTLResourceStorageModeShared];
+    tokenImpl->outDistBuf = outDistBuf;
+    tokenImpl->outIdxBuf = outIdxBuf;
+
+    id<MTLBuffer> queryNormsBuf = nil;
+    if (metric_type == faiss::METRIC_L2) {
+        queryNormsBuf = [device newBufferWithLength:n * sizeof(float)
+                                            options:MTLResourceStorageModePrivate];
+        tokenImpl->queryNormBuf = queryNormsBuf;
+    }
+
+    id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
+
+    bool usedFused = impl_->distance->encodeFused(
+            cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
+            outDistBuf, outIdxBuf,
+            n, ntotal, d, effective_k, metric_type);
+
+    if (!usedFused) {
+        size_t distBytes = n * ntotal * sizeof(float);
+        id<MTLBuffer> distBuf = [device newBufferWithLength:distBytes
+                                                     options:MTLResourceStorageModePrivate];
+        tokenImpl->distBuf = distBuf;
+
+        impl_->distance->encode(
+                cmdBuf, queryBuf, vecBuf, normBuf, queryNormsBuf,
+                distBuf, n, ntotal, d, metric_type);
+        impl_->selector->encode(
+                cmdBuf, distBuf, outDistBuf, outIdxBuf,
+                nil, nil, nil, n, ntotal, effective_k, metric_type);
+    }
+
+    [cmdBuf commit];
+    tokenImpl->cmdBuf = cmdBuf;
+
+    return MetalSearchToken(std::move(tokenImpl));
 }
 
 void MetalIndexFlat::reset() {
