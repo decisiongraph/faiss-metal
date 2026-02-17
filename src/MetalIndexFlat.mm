@@ -374,7 +374,7 @@ void MetalIndexFlat::search(
                 distBuf, n, ntotal, d, metric_type);
         impl_->selector->encode(
                 cmdBuf, distBuf, outDistBuf, outIdxBuf,
-                nil, nil, nil, n, ntotal, effective_k, metric_type);
+                n, ntotal, effective_k, metric_type);
     }
 
     [cmdBuf commit];
@@ -480,7 +480,7 @@ MetalSearchToken MetalIndexFlat::searchAsync(
                 distBuf, n, ntotal, d, metric_type);
         impl_->selector->encode(
                 cmdBuf, distBuf, outDistBuf, outIdxBuf,
-                nil, nil, nil, n, ntotal, effective_k, metric_type);
+                n, ntotal, effective_k, metric_type);
     }
 
     [cmdBuf commit];

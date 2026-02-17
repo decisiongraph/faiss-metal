@@ -2,11 +2,15 @@
 #import <faiss-metal/StandardMetalResources.h>
 #import <faiss-metal/MetalDeviceCapabilities.h>
 
-#include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+
+// assert() is disabled by -DNDEBUG; use FATAL_CHECK for real runtime checks
+#define FATAL_CHECK(cond, msg) \
+    do { if (!(cond)) { printf("FATAL: %s\n", msg); abort(); } } while (0)
 
 // Internal headers for direct testing
 #include "../src/MetalL2Norm.h"
@@ -50,7 +54,7 @@ static void test_l2_norm() {
             cpuNorm += v * v;
         }
         float diff = std::abs(metalNorms[i] - cpuNorm);
-        assert(diff < 1e-3f && "L2 norm mismatch");
+        FATAL_CHECK(diff < 1e-3f, "L2 norm mismatch");
     }
 
     printf("PASS\n");
@@ -89,7 +93,7 @@ static void test_l2_norm_large_dim() {
             cpuNorm += v * v;
         }
         float relDiff = std::abs(metalNorms[i] - cpuNorm) / std::max(cpuNorm, 1e-6f);
-        assert(relDiff < 1e-4f && "L2 norm (large dim) mismatch");
+        FATAL_CHECK(relDiff < 1e-4f, "L2 norm (large dim) mismatch");
     }
 
     printf("PASS\n");
@@ -148,7 +152,7 @@ static void test_l2_distance() {
             float absDiff = std::abs(metalDist[i * nv + j] - cpuDist);
             float relDiff = absDiff / std::max(cpuDist, 1e-6f);
             // FP16 GEMM path (M2+) has ~1e-2 relative error; FP32 MPS path ~1e-4
-            assert(relDiff < 5e-2f && "L2 distance mismatch");
+            FATAL_CHECK(relDiff < 5e-2f, "L2 distance mismatch");
         }
     }
 
@@ -199,7 +203,7 @@ static void test_ip_distance() {
             float absDiff = std::abs(metalDist[i * nv + j] - cpuDist);
             float relDiff = absDiff / std::max(std::abs(cpuDist), 1e-6f);
             // FP16 GEMM path (M2+) has ~1e-2 relative error; FP32 MPS path ~1e-4
-            assert(relDiff < 5e-2f && "IP distance mismatch");
+            FATAL_CHECK(relDiff < 5e-2f, "IP distance mismatch");
         }
     }
 
@@ -223,7 +227,7 @@ static void test_ip_distance() {
                 cpuBest = j;
             }
         }
-        assert(metalBest == cpuBest && "IP top-1 label mismatch");
+        FATAL_CHECK(metalBest == cpuBest, "IP top-1 label mismatch");
     }
 
     printf("PASS\n");
@@ -281,7 +285,7 @@ static void test_forced_mps_l2() {
     // Both paths should agree within tolerance
     for (size_t i = 0; i < nq * nv; i++) {
         float relDiff = std::abs(d1[i] - d2[i]) / std::max(std::abs(d1[i]), 1e-6f);
-        assert(relDiff < 5e-2f && "Default vs forced-MPS L2 mismatch");
+        FATAL_CHECK(relDiff < 5e-2f, "Default vs forced-MPS L2 mismatch");
     }
 
     printf("PASS\n");
@@ -330,7 +334,7 @@ static void test_forced_mps_ip() {
 
     for (size_t i = 0; i < nq * nv; i++) {
         float relDiff = std::abs(d1[i] - d2[i]) / std::max(std::abs(d1[i]), 1e-6f);
-        assert(relDiff < 5e-2f && "Default vs forced-MPS IP mismatch");
+        FATAL_CHECK(relDiff < 5e-2f, "Default vs forced-MPS IP mismatch");
     }
 
     printf("PASS\n");

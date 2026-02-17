@@ -23,38 +23,39 @@ kernel void warp_select_min(
 
     device const float* row_data = distances + row * nv;
 
-    for (uint i = lane; i < nv; i += 32) {
-        float d = row_data[i];
+    for (uint base = 0; base < nv; base += 32) {
+        // All 32 lanes read one candidate each (coalesced)
+        uint cand_idx = base + lane;
+        float d = (cand_idx < nv) ? row_data[cand_idx] : INFINITY;
 
-        // Threshold: worst value currently in top-k (lane k-1)
+        // Quick check: skip batch if no candidate beats threshold
         float threshold = simd_broadcast(my_dist, k - 1);
+        bool dominated = simd_all(d >= threshold);
+        if (dominated) continue;
 
-        if (d < threshold) {
-            // Find insertion point: count how many current top-k values are better
-            uint pos = 0;
-            for (uint j = 0; j < k; j++) {
-                float other = simd_broadcast(my_dist, j);
-                if (d >= other) pos++;
-            }
-
-            if (pos < k) {
-                // Snapshot current values across ALL lanes before any mutation
-                // Use simd_shuffle to read lane-1's value from the snapshot
-                float old_dist = my_dist;
-                int32_t old_idx = my_idx;
-
-                if (lane == pos) {
-                    // This lane takes the new value
-                    my_dist = d;
-                    my_idx = (int32_t)i;
-                } else if (lane > pos && lane < k) {
-                    // Shift down: this lane takes what was in lane-1
-                    // simd_shuffle reads from the pre-mutation snapshot (old_dist)
-                    // which is correct since all lanes captured their values above
-                    my_dist = simd_shuffle(old_dist, lane - 1);
-                    my_idx = simd_shuffle(old_idx, lane - 1);
+        // Process each lane's candidate one by one via simd_broadcast
+        for (uint l = 0; l < 32 && (base + l) < nv; l++) {
+            float cand_d = simd_broadcast(d, l);
+            float th = simd_broadcast(my_dist, k - 1);
+            if (cand_d < th) {
+                // Find insertion point: count how many current top-k values are better
+                uint pos = 0;
+                for (uint j = 0; j < k; j++) {
+                    if (cand_d >= simd_broadcast(my_dist, j)) pos++;
                 }
-                // Lanes < pos and lanes >= k: unchanged
+
+                if (pos < k) {
+                    float old_dist = my_dist;
+                    int32_t old_idx = my_idx;
+
+                    if (lane == pos) {
+                        my_dist = cand_d;
+                        my_idx = (int32_t)(base + l);
+                    } else if (lane > pos && lane < k) {
+                        my_dist = simd_shuffle(old_dist, lane - 1);
+                        my_idx = simd_shuffle(old_idx, lane - 1);
+                    }
+                }
             }
         }
     }
@@ -81,27 +82,37 @@ kernel void warp_select_max(
 
     device const float* row_data = distances + row * nv;
 
-    for (uint i = lane; i < nv; i += 32) {
-        float d = row_data[i];
+    for (uint base = 0; base < nv; base += 32) {
+        // All 32 lanes read one candidate each (coalesced)
+        uint cand_idx = base + lane;
+        float d = (cand_idx < nv) ? row_data[cand_idx] : -INFINITY;
+
+        // Quick check: skip batch if no candidate beats threshold
         float threshold = simd_broadcast(my_dist, k - 1);
+        bool dominated = simd_all(d <= threshold);
+        if (dominated) continue;
 
-        if (d > threshold) {
-            uint pos = 0;
-            for (uint j = 0; j < k; j++) {
-                float other = simd_broadcast(my_dist, j);
-                if (d <= other) pos++;
-            }
+        // Process each lane's candidate one by one via simd_broadcast
+        for (uint l = 0; l < 32 && (base + l) < nv; l++) {
+            float cand_d = simd_broadcast(d, l);
+            float th = simd_broadcast(my_dist, k - 1);
+            if (cand_d > th) {
+                uint pos = 0;
+                for (uint j = 0; j < k; j++) {
+                    if (cand_d <= simd_broadcast(my_dist, j)) pos++;
+                }
 
-            if (pos < k) {
-                float old_dist = my_dist;
-                int32_t old_idx = my_idx;
+                if (pos < k) {
+                    float old_dist = my_dist;
+                    int32_t old_idx = my_idx;
 
-                if (lane == pos) {
-                    my_dist = d;
-                    my_idx = (int32_t)i;
-                } else if (lane > pos && lane < k) {
-                    my_dist = simd_shuffle(old_dist, lane - 1);
-                    my_idx = simd_shuffle(old_idx, lane - 1);
+                    if (lane == pos) {
+                        my_dist = cand_d;
+                        my_idx = (int32_t)(base + l);
+                    } else if (lane > pos && lane < k) {
+                        my_dist = simd_shuffle(old_dist, lane - 1);
+                        my_idx = simd_shuffle(old_idx, lane - 1);
+                    }
                 }
             }
         }

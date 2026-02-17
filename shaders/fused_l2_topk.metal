@@ -6,15 +6,14 @@ using namespace metal;
 /// Computes L2 distances and maintains running top-k in one pass,
 /// eliminating the nq*nv intermediate distance matrix.
 ///
-/// Uses 4 simdgroups per query: each scans nv/4 vectors independently
-/// with warp_select, then simdgroup 0 merges the 4 partial top-k lists.
+/// Memory access: All 32 lanes in a simdgroup cooperatively compute
+/// the dot product for ONE vector at a time, each lane handling
+/// consecutive dimensions (perfectly coalesced device reads).
+/// Prior design had each lane processing a separate vector with
+/// stride = d * elem_size, causing < 5% bandwidth utilization.
 ///
 /// Dispatch: grid = (nq, 1), threadgroup = (32, 4) = 128 threads
 /// Requires: k <= 32
-
-// Shared query vector (dynamically sized via threadgroup memory)
-// Layout: [d] floats at index 0
-// Partial results: [4][32] floats at index 1, [4][32] int32 at index 2
 
 kernel void fused_l2_topk_min(
     device const float* queries [[buffer(0)]],    // (nq x d)
@@ -52,19 +51,21 @@ kernel void fused_l2_topk_min(
     uint chunk_start = simd_group * chunk_size;
     uint chunk_end = min(chunk_start + chunk_size, nv);
 
-    // Warp-select state (per-lane, same logic as warp_select_min)
+    // Warp-select state (lanes 0..k-1 hold sorted top-k)
     float my_dist = INFINITY;
     int32_t my_idx = -1;
 
-    for (uint v = chunk_start + lane; v < chunk_end; v += 32) {
-        // Dot product: half-precision multiply, float accumulate
-        float dot = 0.0f;
-        for (uint j = 0; j < dim; j++) {
-            dot += float(half(shared_query[j]) * half(vectors[v * dim + j]));
+    // Process ONE vector at a time. All 32 lanes split the dot product
+    // across dimensions → consecutive lanes read consecutive addresses (coalesced).
+    for (uint v = chunk_start; v < chunk_end; v++) {
+        float partial = 0.0f;
+        for (uint j = lane; j < dim; j += 32) {
+            partial += shared_query[j] * vectors[v * dim + j];
         }
+        float dot = simd_sum(partial);
         float dist = qnorm + vec_norms[v] - 2.0f * dot;
 
-        // Warp select insertion
+        // Warp select insertion (all lanes see same dist and v → correct)
         float threshold = simd_broadcast(my_dist, k - 1);
         if (dist < threshold) {
             uint pos = 0;
@@ -164,11 +165,12 @@ kernel void fused_ip_topk_max(
     float my_dist = -INFINITY;
     int32_t my_idx = -1;
 
-    for (uint v = chunk_start + lane; v < chunk_end; v += 32) {
-        float dot = 0.0f;
-        for (uint j = 0; j < dim; j++) {
-            dot += float(half(shared_query[j]) * half(vectors[v * dim + j]));
+    for (uint v = chunk_start; v < chunk_end; v++) {
+        float partial = 0.0f;
+        for (uint j = lane; j < dim; j += 32) {
+            partial += shared_query[j] * vectors[v * dim + j];
         }
+        float dot = simd_sum(partial);
 
         float threshold = simd_broadcast(my_dist, k - 1);
         if (dot > threshold) {
@@ -273,11 +275,12 @@ kernel void fused_l2_topk_min_f16storage(
     float my_dist = INFINITY;
     int32_t my_idx = -1;
 
-    for (uint v = chunk_start + lane; v < chunk_end; v += 32) {
-        float dot = 0.0f;
-        for (uint j = 0; j < dim; j++) {
-            dot += float(half(shared_query[j]) * vectors[v * dim + j]);
+    for (uint v = chunk_start; v < chunk_end; v++) {
+        float partial = 0.0f;
+        for (uint j = lane; j < dim; j += 32) {
+            partial += float(half(shared_query[j]) * vectors[v * dim + j]);
         }
+        float dot = simd_sum(partial);
         float dist = qnorm + vec_norms[v] - 2.0f * dot;
 
         float threshold = simd_broadcast(my_dist, k - 1);
@@ -375,11 +378,12 @@ kernel void fused_ip_topk_max_f16storage(
     float my_dist = -INFINITY;
     int32_t my_idx = -1;
 
-    for (uint v = chunk_start + lane; v < chunk_end; v += 32) {
-        float dot = 0.0f;
-        for (uint j = 0; j < dim; j++) {
-            dot += float(half(shared_query[j]) * vectors[v * dim + j]);
+    for (uint v = chunk_start; v < chunk_end; v++) {
+        float partial = 0.0f;
+        for (uint j = lane; j < dim; j += 32) {
+            partial += float(half(shared_query[j]) * vectors[v * dim + j]);
         }
+        float dot = simd_sum(partial);
 
         float threshold = simd_broadcast(my_dist, k - 1);
         if (dot > threshold) {

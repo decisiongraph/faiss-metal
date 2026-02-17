@@ -4,11 +4,15 @@
 #import <faiss-metal/MetalDeviceCapabilities.h>
 #import <faiss/IndexFlat.h>
 
-#include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
+
+// assert() is disabled by -DNDEBUG; use FATAL_CHECK for real runtime checks
+#define FATAL_CHECK(cond, msg) \
+    do { if (!(cond)) { printf("FATAL: %s\n", msg); abort(); } } while (0)
 
 using namespace faiss_metal;
 
@@ -55,7 +59,7 @@ static void compare_results(
             top1_mismatches++;
         }
     }
-    assert(top1_mismatches == 0 && "Top-1 labels must match exactly");
+    FATAL_CHECK(top1_mismatches == 0, "Top-1 labels must match exactly");
 }
 
 static void test_flat_l2(size_t nv, size_t nq, size_t d, size_t k) {
@@ -153,12 +157,12 @@ static void test_conversion() {
     auto res = std::make_shared<StandardMetalResources>();
     auto metal_index = index_cpu_to_metal(res, &cpu_index);
 
-    assert(metal_index->ntotal == cpu_index.ntotal);
-    assert(metal_index->d == cpu_index.d);
+    FATAL_CHECK(metal_index->ntotal == cpu_index.ntotal, "ntotal mismatch after conversion");
+    FATAL_CHECK(metal_index->d == cpu_index.d, "dimension mismatch after conversion");
 
     // Convert back to CPU
     auto cpu_index2 = index_metal_to_cpu(metal_index.get());
-    assert(cpu_index2->ntotal == cpu_index.ntotal);
+    FATAL_CHECK(cpu_index2->ntotal == cpu_index.ntotal, "ntotal mismatch after round-trip");
 
     // Search both and compare
     std::vector<float> d1(nq * k), d2(nq * k);
@@ -168,8 +172,8 @@ static void test_conversion() {
     cpu_index2->search(nq, queries.data(), k, d2.data(), l2.data());
 
     for (size_t i = 0; i < nq * k; i++) {
-        assert(l1[i] == l2[i] && "Round-trip label mismatch");
-        assert(std::abs(d1[i] - d2[i]) < 1e-5f && "Round-trip distance mismatch");
+        FATAL_CHECK(l1[i] == l2[i], "Round-trip label mismatch");
+        FATAL_CHECK(std::abs(d1[i] - d2[i]) < 1e-5f, "Round-trip distance mismatch");
     }
 
     printf("PASS\n");
@@ -183,14 +187,14 @@ static void test_reset() {
 
     std::vector<float> data(100 * 32, 1.0f);
     index.add(100, data.data());
-    assert(index.ntotal == 100);
+    FATAL_CHECK(index.ntotal == 100, "ntotal should be 100 after add");
 
     index.reset();
-    assert(index.ntotal == 0);
+    FATAL_CHECK(index.ntotal == 0, "ntotal should be 0 after reset");
 
     // Add again after reset
     index.add(50, data.data());
-    assert(index.ntotal == 50);
+    FATAL_CHECK(index.ntotal == 50, "ntotal should be 50 after re-add");
 
     printf("PASS\n");
 }
@@ -213,7 +217,7 @@ static void test_reconstruct() {
     for (int i = 0; i < 10; i++) {
         index.reconstruct(i, recons.data());
         for (int j = 0; j < d; j++) {
-            assert(recons[j] == data[i * d + j] && "Reconstruct mismatch");
+            FATAL_CHECK(recons[j] == data[i * d + j], "Reconstruct mismatch");
         }
     }
 
@@ -242,7 +246,7 @@ static void test_flat_l2_f16(size_t nv, size_t nq, size_t d, size_t k) {
     // Metal FP16
     auto res = std::make_shared<StandardMetalResources>();
     MetalIndexFlat metal_index(res, d, faiss::METRIC_L2, /*useFloat16Storage=*/true);
-    assert(metal_index.isFloat16Storage());
+    FATAL_CHECK(metal_index.isFloat16Storage(), "FP16 storage flag not set");
     metal_index.add(nv, vectors.data());
 
     std::vector<float> metal_distances(nq * k);
@@ -261,7 +265,7 @@ static void test_flat_l2_f16(size_t nv, size_t nq, size_t d, size_t k) {
     // Half precision: ~3 decimal digits, so ~1e-3 tolerance per element
     for (size_t i = 0; i < (size_t)d; i++) {
         float diff = std::abs(recons[i] - vectors[i]);
-        assert(diff < 2e-3f && "FP16 reconstruct precision too low");
+        FATAL_CHECK(diff < 2e-3f, "FP16 reconstruct precision too low");
     }
 
     printf("PASS\n");
@@ -339,8 +343,8 @@ static void test_search_async() {
 
     // Results must match exactly (same GPU, same buffers, deterministic)
     for (size_t i = 0; i < nq * k; i++) {
-        assert(async_labels[i] == sync_labels[i] && "Async label mismatch");
-        assert(async_distances[i] == sync_distances[i] && "Async distance mismatch");
+        FATAL_CHECK(async_labels[i] == sync_labels[i], "Async label mismatch");
+        FATAL_CHECK(async_distances[i] == sync_distances[i], "Async distance mismatch");
     }
 
     printf("PASS\n");
@@ -392,8 +396,8 @@ static void test_search_async_multiple() {
         metal_index.search(nq, q, k, sd.data(), sl.data());
 
         for (size_t i = 0; i < nq * k; i++) {
-            assert(al[i] == sl[i] && "Concurrent async label mismatch");
-            assert(ad[i] == sd[i] && "Concurrent async distance mismatch");
+            FATAL_CHECK(al[i] == sl[i], "Concurrent async label mismatch");
+            FATAL_CHECK(ad[i] == sd[i], "Concurrent async distance mismatch");
         }
     }
 
@@ -430,7 +434,7 @@ static void test_search_async_isready() {
 
     // Sanity: labels should be valid
     for (size_t i = 0; i < (size_t)k; i++) {
-        assert(labels[i] >= 0 && labels[i] < (faiss::idx_t)nv);
+        FATAL_CHECK(labels[i] >= 0 && labels[i] < (faiss::idx_t)nv, "Async isReady: invalid label");
     }
 
     printf("PASS\n");
@@ -449,13 +453,13 @@ static void test_search_async_empty() {
     auto t1 = metal_index.searchAsync(1, query.data(), 5, dists.data(), labels.data());
     t1.wait();
     for (int i = 0; i < 5; i++) {
-        assert(dists[i] == INFINITY);
-        assert(labels[i] == -1);
+        FATAL_CHECK(dists[i] == INFINITY, "Empty index should return INFINITY distance");
+        FATAL_CHECK(labels[i] == -1, "Empty index should return -1 label");
     }
 
     // n=0 case
     auto t2 = metal_index.searchAsync(0, nullptr, 5, nullptr, nullptr);
-    assert(t2.isReady());
+    FATAL_CHECK(t2.isReady(), "n=0 async should be immediately ready");
     t2.wait();
 
     printf("PASS\n");
@@ -485,6 +489,12 @@ int main() {
         // FP16 storage
         test_flat_l2_f16(1000, 10, 128, 10);
         test_flat_l2_f16(500, 5, 768, 5);
+
+        // k > 32: exercises block_select path (bitonic merge)
+        test_flat_l2(5000, 5, 128, 33);
+        test_flat_l2(5000, 5, 128, 64);
+        test_flat_l2(5000, 5, 128, 128);
+        test_flat_ip(5000, 5, 128, 64);
 
         // Edge cases
         test_flat_l2(100, 1, 32, 1);   // single query, k=1

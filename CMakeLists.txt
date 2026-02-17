@@ -39,7 +39,7 @@ if(REAL_MACOS_SDK AND TARGET faiss)
 endif()
 
 # --- Compile .metal shaders → .metallib ---
-file(GLOB METAL_SOURCES ${CMAKE_SOURCE_DIR}/shaders/*.metal)
+file(GLOB METAL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.metal)
 
 # Use /usr/bin/xcrun to bypass nix xcrun wrapper which lacks Metal Toolchain support
 find_program(XCRUN_EXECUTABLE xcrun PATHS /usr/bin NO_DEFAULT_PATH)
@@ -54,7 +54,7 @@ foreach(METAL_SRC ${METAL_SOURCES})
     set(AIR_FILE ${CMAKE_BINARY_DIR}/${METAL_NAME}.air)
     add_custom_command(
         OUTPUT ${AIR_FILE}
-        COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal3.1 -I ${CMAKE_SOURCE_DIR}/shaders -c ${METAL_SRC} -o ${AIR_FILE}
+        COMMAND ${XCRUN_EXECUTABLE} -sdk macosx metal -std=metal3.1 -mmacos-version-min=15.0 -I ${CMAKE_CURRENT_SOURCE_DIR}/shaders -c ${METAL_SRC} -o ${AIR_FILE}
         DEPENDS ${METAL_SRC}
         COMMENT "Compiling ${METAL_NAME}.metal → .air"
     )
@@ -78,6 +78,7 @@ set(FAISS_METAL_SOURCES
     src/MetalDistance.mm
     src/MetalSelect.mm
     src/MetalIndexFlat.mm
+    src/MetalIndexIVFFlat.mm
 )
 
 add_library(faiss_metal STATIC ${FAISS_METAL_SOURCES})
@@ -85,10 +86,10 @@ add_dependencies(faiss_metal metal_shaders)
 
 target_include_directories(faiss_metal
     PUBLIC
-        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/shaders
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders
 )
 
 # Prioritize real SDK framework headers over nix apple-sdk frameworks.
@@ -134,4 +135,9 @@ if(FAISS_METAL_BUILD_TESTS)
     add_executable(bench_metal_flat tests/bench_metal_flat.mm)
     target_link_libraries(bench_metal_flat faiss_metal faiss
         "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
+
+    add_executable(test_metal_ivfflat tests/test_metal_ivfflat.mm)
+    target_link_libraries(test_metal_ivfflat faiss_metal faiss
+        "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
+    add_test(NAME test_metal_ivfflat COMMAND test_metal_ivfflat)
 endif()

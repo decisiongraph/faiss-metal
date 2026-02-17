@@ -10,25 +10,19 @@ namespace faiss_metal {
 class MetalResources;
 
 /// Top-k selection from a distance matrix.
-/// Routes to different implementations based on k and device capabilities:
-///   k <= 16: MPSMatrixFindTopK
+/// Routes to different implementations based on k:
 ///   k <= 32: warp_select (SIMD-group level)
-///   k > 32: block_select (threadgroup level)
+///   k > 32: block_select (threadgroup level, bitonic merge)
 class MetalSelect {
    public:
     MetalSelect(MetalResources* resources);
 
     /// Encode top-k selection into an existing command buffer.
-    /// For k <= 16 with L2, caller must provide scratchBuf sized nq*nv*sizeof(float)
-    /// for the negated distance copy. Pass nil if metric is IP or k > 16.
     void encode(
             id<MTLCommandBuffer> cmdBuf,
             id<MTLBuffer> distances,
             id<MTLBuffer> outDistances,
             id<MTLBuffer> outIndices,
-            id<MTLBuffer> mpsOutDistBuf,
-            id<MTLBuffer> mpsOutIdxBuf,
-            id<MTLBuffer> mpsNegateBuf,
             size_t nq,
             size_t nv,
             size_t k,

@@ -5,3 +5,4 @@
 #include "MetalResources.h"
 #include "StandardMetalResources.h"
 #include "MetalIndexFlat.h"
+#include "MetalIndexIVFFlat.h"

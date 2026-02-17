@@ -36,9 +36,6 @@ void MetalSelect::encode(
         id<MTLBuffer> distances,
         id<MTLBuffer> outDistances,
         id<MTLBuffer> outIndices,
-        id<MTLBuffer> /* unused */,
-        id<MTLBuffer> /* unused */,
-        id<MTLBuffer> /* unused */,
         size_t nq,
         size_t nv,
         size_t k,
@@ -102,7 +99,7 @@ void MetalSelect::select(
 
     id<MTLCommandBuffer> cmdBuf = [queue commandBuffer];
     encode(cmdBuf, distances, outDistances, outIndices,
-           nil, nil, nil, nq, nv, k, metric);
+           nq, nv, k, metric);
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
 }
